@@ -32,8 +32,8 @@ const SEFAZ_URLS = {
     homologacao: "https://hom1.nfe.fazenda.gov.br/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx",
   },
   recepcao_evento: {
-    producao: "https://www.nfe.fazenda.gov.br/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx",
-    homologacao: "https://homologacao.nfe.fazenda.gov.br/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx",
+    producao: "https://www1.nfe.fazenda.gov.br/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx",
+    homologacao: "https://hom1.nfe.fazenda.gov.br/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx",
   },
 };
 
@@ -211,7 +211,7 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
   let respText;
   try {
     console.log(`[consulta-chave] Chave: ${chave} | CNPJ: ${cnpj}`);
-    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4");
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
     respText = resp.body;
     console.log(`[consulta-chave] HTTP ${resp.status}`);
   } catch (e) {
@@ -277,7 +277,7 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
     let respText;
     try {
       console.log(`[sync] Loop ${loops} | NSU: ${pad15(ultNSU)} | ${empresa.razao_social}`);
-      const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4");
+      const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
       respText = resp.body;
       console.log(`[sync] SEFAZ HTTP ${resp.status}`);
     } catch (e) {
@@ -446,7 +446,7 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
   let respText;
   try {
     console.log(`[manifestar] ${tipo_manifestacao} | NF: ${nf.chave_acesso.slice(-10)}`);
-    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4");
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
     respText = resp.body;
   } catch (e) {
     return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}` });
@@ -498,7 +498,7 @@ app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
   let respText;
   try {
     console.log(`[manifestar-chave] ${tipo_manifestacao} | Chave: ${chave} | CNPJ: ${cnpj}`);
-    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4");
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
     respText = resp.body;
     console.log(`[manifestar-chave] HTTP ${resp.status}`);
   } catch (e) {
