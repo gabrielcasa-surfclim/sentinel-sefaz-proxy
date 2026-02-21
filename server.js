@@ -101,8 +101,7 @@ function decompressGzip(b64) {
 
 function buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU) {
   const nsu = pad15(ultNSU);
-  const body = `<?xml version="1.0" encoding="utf-8"?>
-<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
+  const body = `<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
   <tpAmb>${tpAmb}</tpAmb>
   <cUFAutor>${ufCode}</cUFAutor>
   <CNPJ>${cnpj}</CNPJ>
@@ -115,7 +114,7 @@ function buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU) {
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
   <soap12:Body>
     <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
-      <nfeDadosMsg>${escapeXml(body)}</nfeDadosMsg>
+      <nfeDadosMsg>${body}</nfeDadosMsg>
     </nfeDistDFeInteresse>
   </soap12:Body>
 </soap12:Envelope>`;
@@ -133,7 +132,7 @@ function buildManifestacaoSoap(chNFe, cnpj, tpAmb, codigoEvento, descEvento, jus
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
   <soap12:Body>
     <nfeRecepcaoEvento xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4">
-      <nfeDadosMsg>${escapeXml(eventoXml)}</nfeDadosMsg>
+      <nfeDadosMsg>${eventoXml}</nfeDadosMsg>
     </nfeRecepcaoEvento>
   </soap12:Body>
 </soap12:Envelope>`;
