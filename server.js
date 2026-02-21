@@ -5,6 +5,7 @@ const https = require("https");
 const { URL } = require("url");
 const pako = require("pako");
 const { createClient } = require("@supabase/supabase-js");
+const { SignedXml } = require("xml-crypto");
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -24,7 +25,7 @@ function getSupabaseAdmin() {
 }
 
 // ══════════════════════════════════════════════════════
-// SEFAZ CLIENT
+// SEFAZ CONFIG
 // ══════════════════════════════════════════════════════
 const SEFAZ_URLS = {
   dist_dfe: {
@@ -51,6 +52,9 @@ const MANIFESTACAO = {
   nao_realizada: { codigo: "210240", descricao: "Operacao nao Realizada" },
 };
 
+// ══════════════════════════════════════════════════════
+// FUNÇÕES AUXILIARES
+// ══════════════════════════════════════════════════════
 function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000, soapAction = null) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -70,21 +74,16 @@ function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000, soapAct
       headers, cert: certPem, key: keyPem, rejectUnauthorized: true, timeout: timeoutMs,
     };
     console.log(`[sefazRequest] URL: ${url}`);
-    console.log(`[sefazRequest] Headers: ${JSON.stringify(headers)}`);
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
       res.on("end", () => resolve({ status: res.statusCode, body: data }));
     });
     req.on("error", (err) => reject(err));
-    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout na conexão com a SEFAZ")); });
+    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout SEFAZ")); });
     req.write(soapBody);
     req.end();
   });
-}
-
-function escapeXml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 function xmlTag(xml, tag) {
@@ -99,7 +98,6 @@ function pad15(nsu) {
 function dhEvento() {
   const now = new Date();
   const off = -3;
-  const sign = "-";
   const local = new Date(now.getTime() + off * 3600000);
   const iso = local.toISOString().replace("Z", "").slice(0, 19);
   return `${iso}-03:00`;
@@ -111,47 +109,116 @@ function decompressGzip(b64) {
   return Buffer.from(decompressed).toString("utf-8");
 }
 
-function buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU) {
-  const nsu = pad15(ultNSU);
-  const body = `<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-  <tpAmb>${tpAmb}</tpAmb>
-  <cUFAutor>${ufCode}</cUFAutor>
-  <CNPJ>${cnpj}</CNPJ>
-  <distNSU>
-    <ultNSU>${nsu}</ultNSU>
-  </distNSU>
-</distDFeInt>`;
-
-  return `<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
-      <nfeDadosMsg>${body}</nfeDadosMsg>
-    </nfeDistDFeInteresse>
-  </soap12:Body>
-</soap12:Envelope>`;
+// ══════════════════════════════════════════════════════
+// ASSINATURA DIGITAL XML (XMLDSig) - SEFAZ NF-e
+// ══════════════════════════════════════════════════════
+//
+// A SEFAZ exige que o <evento> contenha uma assinatura digital XML
+// (enveloped signature) referenciando o <infEvento> pelo atributo Id.
+//
+// Algoritmos exigidos pela SEFAZ:
+//   - Canonicalização: C14N 1.0 (http://www.w3.org/TR/2001/REC-xml-c14n-20010315)
+//   - Digest: SHA-256 (a partir da NT 2019.001)
+//   - Assinatura: RSA-SHA1 (ainda aceito) ou RSA-SHA256
+//   - Transforms: enveloped-signature + C14N 1.0
+//
+// O bloco <Signature> deve ficar DENTRO do <evento>, após </infEvento>.
+// O certificado X509 do destinatário deve estar em <KeyInfo>.
+//
+function extrairCertBase64(certPem) {
+  return certPem
+    .replace(/-----BEGIN CERTIFICATE-----/g, "")
+    .replace(/-----END CERTIFICATE-----/g, "")
+    .replace(/\s/g, "");
 }
 
-function buildManifestacaoSoap(chNFe, cnpj, tpAmb, codigoEvento, descEvento, justificativa) {
+function assinarEvento(eventoXml, certPem, keyPem) {
+  // Extrai o certificado em base64 limpo (sem headers PEM)
+  const certBase64 = extrairCertBase64(certPem);
+
+  // Cria o SignedXml usando a API v6+ do xml-crypto
+  // - privateKey: chave privada PEM para assinar
+  // - canonicalizationAlgorithm: C14N 1.0 (exigido pela SEFAZ)
+  // - signatureAlgorithm: RSA-SHA1 (aceito pela SEFAZ)
+  // - getKeyInfoContent: função que retorna o conteúdo do <KeyInfo>
+  //   com o certificado X509 do destinatário
+  const sig = new SignedXml({
+    privateKey: keyPem,
+    canonicalizationAlgorithm: "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+    signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+    getKeyInfoContent: function () {
+      return `<X509Data><X509Certificate>${certBase64}</X509Certificate></X509Data>`;
+    },
+  });
+
+  // Adiciona a referência ao infEvento
+  // A SEFAZ exige: enveloped-signature + C14N 1.0, digest SHA-1
+  // O xml-crypto automaticamente detecta o atributo Id e gera URI="#ID..."
+  sig.addReference({
+    xpath: "//*[local-name(.)='infEvento']",
+    transforms: [
+      "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+      "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+    ],
+    digestAlgorithm: "http://www.w3.org/2000/09/xmldsig#sha1",
+  });
+
+  // Computa a assinatura — coloca o <Signature> após o </infEvento>, dentro do <evento>
+  sig.computeSignature(eventoXml, {
+    location: {
+      reference: "//*[local-name(.)='infEvento']",
+      action: "after",
+    },
+  });
+
+  return sig.getSignedXml();
+}
+
+// ══════════════════════════════════════════════════════
+// BUILD SOAP — DISTRIBUIÇÃO DF-e
+// ══════════════════════════════════════════════════════
+function buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU) {
+  const nsu = pad15(ultNSU);
+  const body = `<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01"><tpAmb>${tpAmb}</tpAmb><cUFAutor>${ufCode}</cUFAutor><CNPJ>${cnpj}</CNPJ><distNSU><ultNSU>${nsu}</ultNSU></distNSU></distDFeInt>`;
+
+  return `<?xml version="1.0" encoding="utf-8"?><soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"><soap12:Body><nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe"><nfeDadosMsg>${body}</nfeDadosMsg></nfeDistDFeInteresse></soap12:Body></soap12:Envelope>`;
+}
+
+// ══════════════════════════════════════════════════════
+// BUILD SOAP — MANIFESTAÇÃO (com assinatura digital)
+// ══════════════════════════════════════════════════════
+function buildManifestacaoSoap(chNFe, cnpj, tpAmb, codigoEvento, descEvento, justificativa, certPem, keyPem) {
   const dh = dhEvento();
   const nSeqEvento = "1";
   const seqPadded = nSeqEvento.padStart(2, "0");
   const eventoId = `ID${codigoEvento}${chNFe}${seqPadded}`;
-  console.log(`[buildManifestacao] Id gerado: ${eventoId} (length: ${eventoId.length})`);
-  console.log(`[buildManifestacao] tpEvento: ${codigoEvento} | chNFe: ${chNFe} (${chNFe.length}) | seq: ${seqPadded}`);
-  const detEvento = justificativa
-    ? `<detEvento versao="1.00"><descEvento>${descEvento}</descEvento><justificativa>${justificativa}</justificativa></detEvento>`
-    : `<detEvento versao="1.00"><descEvento>${descEvento}</descEvento></detEvento>`;
+
+  console.log(`[buildManifestacao] eventoId: ${eventoId} (length: ${eventoId.length})`);
+
+  // Monta o detEvento (compacto, sem espaços extras)
+  let detEvento = `<detEvento versao="1.00"><descEvento>${descEvento}</descEvento>`;
+  if (justificativa) {
+    detEvento += `<xJust>${justificativa}</xJust>`;
+  }
+  detEvento += `</detEvento>`;
+
+  // Monta o XML do <evento> SEM assinatura (compacto!)
+  // IMPORTANTE: o <infEvento> NÃO tem namespace próprio — herda do <evento>
+  // O XML deve ser compacto (sem whitespace) para canonicalização correta
   const eventoXml = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><infEvento Id="${eventoId}"><cOrgao>91</cOrgao><tpAmb>${tpAmb}</tpAmb><CNPJ>${cnpj}</CNPJ><chNFe>${chNFe}</chNFe><dhEvento>${dh}</dhEvento><tpEvento>${codigoEvento}</tpEvento><nSeqEvento>${nSeqEvento}</nSeqEvento><verEvento>1.00</verEvento>${detEvento}</infEvento></evento>`;
 
-  const envioLote = `<envEvento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><idLote>1</idLote>${eventoXml}</envEvento>`;
+  console.log(`[buildManifestacao] Evento antes de assinar:\n${eventoXml}`);
 
-  return `<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4">${envioLote}</nfeDadosMsg>
-  </soap12:Body>
-</soap12:Envelope>`;
+  // Assina o evento (insere <Signature> após </infEvento>, dentro de <evento>)
+  const eventoAssinado = assinarEvento(eventoXml, certPem, keyPem);
+
+  console.log(`[buildManifestacao] Evento assinado:\n${eventoAssinado}`);
+
+  // Monta o envEvento com o evento assinado (compacto)
+  const envioLote = `<envEvento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><idLote>1</idLote>${eventoAssinado}</envEvento>`;
+
+  // Envelope SOAP 1.2 — <nfeDadosMsg> direto no Body, sem wrapper <nfeRecepcaoEvento>
+  return `<?xml version="1.0" encoding="utf-8"?><soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"><soap12:Body><nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4">${envioLote}</nfeDadosMsg></soap12:Body></soap12:Envelope>`;
 }
 
 // ══════════════════════════════════════════════════════
@@ -169,7 +236,12 @@ function authMiddleware(req, res, next) {
 // HEALTH CHECK
 // ══════════════════════════════════════════════════════
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "sentinel-sefaz-proxy", timestamp: new Date().toISOString(), ambiente: process.env.SEFAZ_AMBIENTE || "producao" });
+  res.json({
+    status: "ok",
+    service: "sentinel-sefaz-proxy",
+    timestamp: new Date().toISOString(),
+    ambiente: process.env.SEFAZ_AMBIENTE || "producao",
+  });
 });
 
 // ══════════════════════════════════════════════════════
@@ -178,13 +250,16 @@ app.get("/health", (_req, res) => {
 app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
   const { empresa_id, chave_acesso, ambiente = "producao" } = req.body;
   if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id obrigatório" });
-  if (!chave_acesso || chave_acesso.replace(/\D/g, "").length !== 44) return res.status(400).json({ success: false, error: "chave_acesso inválida (44 dígitos)" });
+  if (!chave_acesso || chave_acesso.replace(/\D/g, "").length !== 44)
+    return res.status(400).json({ success: false, error: "chave_acesso inválida (44 dígitos)" });
 
   const tpAmb = ambiente === "homologacao" ? "2" : "1";
   const sefazUrl = SEFAZ_URLS.dist_dfe[ambiente] || SEFAZ_URLS.dist_dfe.producao;
   const supabase = getSupabaseAdmin();
 
-  const { data: empresa } = await supabase.from("empresas").select("id, cnpj, uf, sefaz_ativo").eq("id", empresa_id).single();
+  const { data: empresa } = await supabase
+    .from("empresas").select("id, cnpj, uf, sefaz_ativo")
+    .eq("id", empresa_id).single();
   if (!empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
 
   const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
@@ -192,28 +267,18 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
   const ufCode = UF_CODE[uf];
   if (!ufCode) return res.status(400).json({ success: false, error: "UF inválida" });
 
-  const { data: cert } = await supabase.from("certificados_digitais").select("cert_pem, key_pem").eq("empresa_id", empresa_id).eq("ativo", true).order("created_at", { ascending: false }).limit(1).maybeSingle();
-  if (!cert || !cert.cert_pem || !cert.key_pem) return res.status(404).json({ success: false, error: "Certificado não configurado" });
+  const { data: cert } = await supabase
+    .from("certificados_digitais").select("cert_pem, key_pem")
+    .eq("empresa_id", empresa_id).eq("ativo", true)
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!cert || !cert.cert_pem || !cert.key_pem)
+    return res.status(404).json({ success: false, error: "Certificado não configurado" });
 
   const chave = chave_acesso.replace(/\D/g, "");
 
-  const body = `<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-  <tpAmb>${tpAmb}</tpAmb>
-  <cUFAutor>${ufCode}</cUFAutor>
-  <CNPJ>${cnpj}</CNPJ>
-  <consChNFe>
-    <chNFe>${chave}</chNFe>
-  </consChNFe>
-</distDFeInt>`;
+  const body = `<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01"><tpAmb>${tpAmb}</tpAmb><cUFAutor>${ufCode}</cUFAutor><CNPJ>${cnpj}</CNPJ><consChNFe><chNFe>${chave}</chNFe></consChNFe></distDFeInt>`;
 
-  const soap = `<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
-  <soap12:Body>
-    <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
-      <nfeDadosMsg>${body}</nfeDadosMsg>
-    </nfeDistDFeInteresse>
-  </soap12:Body>
-</soap12:Envelope>`;
+  const soap = `<?xml version="1.0" encoding="utf-8"?><soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"><soap12:Body><nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe"><nfeDadosMsg>${body}</nfeDadosMsg></nfeDistDFeInteresse></soap12:Body></soap12:Envelope>`;
 
   let respText;
   try {
@@ -227,14 +292,12 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
 
   const cStat = xmlTag(respText, "cStat");
   const xMotivo = xmlTag(respText, "xMotivo");
-
   console.log(`[consulta-chave] cStat: ${cStat} | ${xMotivo}`);
 
-  // Retornar resposta raw para debug
   const retMatch = respText.match(/<retDistDFeInt[\s\S]*?<\/retDistDFeInt>/i);
   return res.json({
     success: cStat === "138",
-    data: { cStat, xMotivo, chave_acesso: chave, retXml: retMatch ? retMatch[0].slice(0, 2000) : null }
+    data: { cStat, xMotivo, chave_acesso: chave, retXml: retMatch ? retMatch[0].slice(0, 2000) : null },
   });
 });
 
@@ -242,180 +305,114 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
 // SYNC SEFAZ — POST /api/sync-sefaz
 // ══════════════════════════════════════════════════════
 app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
-  const { empresa_id, ambiente = "producao", max_loops = 10 } = req.body;
-  if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id é obrigatório" });
+  const { empresa_id, ambiente = "producao" } = req.body;
+  if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id obrigatório" });
 
   const tpAmb = ambiente === "homologacao" ? "2" : "1";
   const sefazUrl = SEFAZ_URLS.dist_dfe[ambiente] || SEFAZ_URLS.dist_dfe.producao;
   const supabase = getSupabaseAdmin();
 
-  // Buscar empresa
-  const { data: empresa, error: empErr } = await supabase.from("empresas").select("id, cnpj, razao_social, uf, sefaz_ativo").eq("id", empresa_id).single();
-  if (empErr || !empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
-  if (!empresa.sefaz_ativo) return res.status(400).json({ success: false, error: "Integração SEFAZ não está ativa" });
+  const { data: empresa } = await supabase
+    .from("empresas").select("id, cnpj, uf, sefaz_ativo, sefaz_ultimo_nsu")
+    .eq("id", empresa_id).single();
+  if (!empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
+  if (!empresa.sefaz_ativo) return res.status(400).json({ success: false, error: "SEFAZ não ativa" });
 
   const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
   const uf = (empresa.uf || "").toUpperCase().trim();
-  if (!cnpj || cnpj.length !== 14) return res.status(400).json({ success: false, error: "CNPJ inválido ou não cadastrado" });
-  if (!uf || !UF_CODE[uf]) return res.status(400).json({ success: false, error: "UF inválida ou não cadastrada" });
-
   const ufCode = UF_CODE[uf];
+  if (!ufCode) return res.status(400).json({ success: false, error: "UF inválida" });
 
-  // Buscar certificado PEM
-  const { data: cert, error: certErr } = await supabase.from("certificados_digitais").select("id, cert_pem, key_pem, data_validade, nome_arquivo").eq("empresa_id", empresa_id).eq("ativo", true).order("created_at", { ascending: false }).limit(1).maybeSingle();
-  if (certErr || !cert) return res.status(404).json({ success: false, error: "Nenhum certificado digital configurado" });
-  if (!cert.cert_pem || !cert.key_pem) return res.status(400).json({ success: false, error: "Certificado sem PEM extraído. Reenvie o certificado." });
-  if (cert.data_validade && new Date(cert.data_validade) < new Date()) return res.status(400).json({ success: false, error: "Certificado digital expirado" });
+  const { data: cert } = await supabase
+    .from("certificados_digitais").select("cert_pem, key_pem")
+    .eq("empresa_id", empresa_id).eq("ativo", true)
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!cert || !cert.cert_pem || !cert.key_pem)
+    return res.status(404).json({ success: false, error: "Certificado não configurado" });
 
-  // Buscar último NSU
-  const { data: ctrlSync } = await supabase.from("controle_sync").select("id, ultimo_nsu").eq("empresa_id", empresa_id).eq("tipo", "sefaz").maybeSingle();
-  let ultNSU = ctrlSync?.ultimo_nsu ?? "0";
-  const ctrlSyncId = ctrlSync?.id ?? null;
+  let ultNSU = empresa.sefaz_ultimo_nsu || "0";
+  let maxNSU = "999999999999999";
+  let totalDocs = 0;
+  let loops = 0;
+  const maxLoops = 5;
 
-  // Loop de consulta DistDFe
-  let notasEncontradas = 0, notasNovas = 0, loops = 0, maxNSU = ultNSU;
-  const errors = [];
-  let shouldStop = false, consumoIndevido = false, nenhumDocumento = false;
-
-  while (loops < max_loops && !shouldStop) {
+  while (ultNSU < maxNSU && loops < maxLoops) {
     loops++;
     const soap = buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU);
 
     let respText;
     try {
-      console.log(`[sync] Loop ${loops} | NSU: ${pad15(ultNSU)} | ${empresa.razao_social}`);
       const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
       respText = resp.body;
-      console.log(`[sync] SEFAZ HTTP ${resp.status}`);
     } catch (e) {
-      console.error(`[sync] Erro conexão: ${e.message}`);
-      errors.push(`Erro de conexão com a SEFAZ: ${e.message}`);
-      break;
+      return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}`, parcial: { totalDocs, ultNSU } });
     }
 
-    const retMatch = respText.match(/<retDistDFeInt[\s\S]*?<\/retDistDFeInt>/i);
-    if (!retMatch) { errors.push("Resposta SOAP inválida"); break; }
-    const retXml = retMatch[0];
+    const cStat = xmlTag(respText, "cStat");
+    const xMotivo = xmlTag(respText, "xMotivo");
+    const newUltNSU = xmlTag(respText, "ultNSU");
+    const newMaxNSU = xmlTag(respText, "maxNSU");
 
-    const cStat = xmlTag(retXml, "cStat");
-    const xMotivo = xmlTag(retXml, "xMotivo");
-    const maxNsuResp = xmlTag(retXml, "maxNSU");
-    const ultNsuResp = xmlTag(retXml, "ultNSU");
+    console.log(`[sync] Loop ${loops}: cStat=${cStat} ultNSU=${newUltNSU} maxNSU=${newMaxNSU}`);
 
-    console.log(`[sync] cStat: ${cStat} | ${xMotivo}`);
-    if (maxNsuResp) maxNSU = maxNsuResp;
+    if (cStat === "137" || cStat === "138") {
+      if (newUltNSU) ultNSU = newUltNSU;
+      if (newMaxNSU) maxNSU = newMaxNSU;
 
-    if (cStat === "137") { nenhumDocumento = true; shouldStop = true; break; }
-    if (cStat === "656") { errors.push("SEFAZ bloqueou consultas (Consumo Indevido). Aguarde 1h."); consumoIndevido = true; shouldStop = true; break; }
-    if (cStat !== "138") { errors.push(`SEFAZ cStat ${cStat}: ${xMotivo}`); break; }
+      const docMatches = respText.match(/<docZip[\s\S]*?<\/docZip>/gi) || [];
+      totalDocs += docMatches.length;
 
-    // Processar docZips
-    const docZipMatches = [...retXml.matchAll(/<docZip\s+[^>]*schema="([^"]+)"[^>]*>([^<]+)<\/docZip>/gi)];
+      for (const docZip of docMatches) {
+        try {
+          const nsuMatch = docZip.match(/NSU="(\d+)"/i);
+          const schemaMatch = docZip.match(/schema="([^"]+)"/i);
+          const b64 = docZip.replace(/<\/?docZip[^>]*>/gi, "").trim();
+          if (!b64) continue;
 
-    for (const match of docZipMatches) {
-      const schema = match[1];
-      const b64 = match[2].trim();
-
-      let xmlDoc;
-      try { xmlDoc = decompressGzip(b64); } catch (e) { errors.push(`Falha descomprimir (${schema})`); continue; }
-      notasEncontradas++;
-
-      try {
-        if (schema.startsWith("resNFe")) {
-          const chNFe = xmlTag(xmlDoc, "chNFe");
-          const emitCnpj = xmlTag(xmlDoc, "CNPJ") || xmlTag(xmlDoc, "CPF");
-          const xNome = xmlTag(xmlDoc, "xNome");
-          const dhEmi = xmlTag(xmlDoc, "dhEmi");
-          const vNF = xmlTag(xmlDoc, "vNF");
+          const xmlContent = decompressGzip(b64);
+          const chNFe = xmlTag(xmlContent, "chNFe");
           if (!chNFe) continue;
 
-          const { data: existing } = await supabase.from("notas_fiscais").select("id").eq("chave_acesso", chNFe).eq("empresa_id", empresa_id).maybeSingle();
-          if (!existing) {
-            let entidadeId = null;
-            if (emitCnpj) {
-              const { data: ent } = await supabase.from("entidades").select("id").eq("empresa_id", empresa_id).eq("cnpj_cpf", emitCnpj).maybeSingle();
-              if (ent) { entidadeId = ent.id; }
-              else if (xNome) { const { data: ne } = await supabase.from("entidades").insert({ empresa_id, razao_social: xNome, cnpj_cpf: emitCnpj, tipo: "fornecedor", ativo: true }).select("id").single(); if (ne) entidadeId = ne.id; }
-            }
-            await supabase.from("notas_fiscais").insert({ empresa_id, chave_acesso: chNFe, emit_cnpj: emitCnpj || null, emit_razao_social: xNome || null, data_emissao: dhEmi || null, valor_total_nf: vNF ? parseFloat(vNF) : null, entidade_id: entidadeId, origem: "sefaz", tipo_documento: "resumo", processado: false, status_manifestacao: "pendente" });
-            notasNovas++;
-            console.log(`[sync] + resumo: ${chNFe.slice(-10)} | ${xNome} | R$ ${vNF}`);
+          const existing = await supabase
+            .from("notas_fiscais").select("id")
+            .eq("empresa_id", empresa_id).eq("chave_acesso", chNFe).maybeSingle();
+
+          if (!existing?.data) {
+            const nsuVal = nsuMatch ? nsuMatch[1] : null;
+            const schema = schemaMatch ? schemaMatch[1] : null;
+            const isResumo = schema && schema.includes("resNFe");
+
+            await supabase.from("notas_fiscais").insert({
+              empresa_id,
+              chave_acesso: chNFe,
+              numero: xmlTag(xmlContent, "nNF") || null,
+              serie: xmlTag(xmlContent, "serie") || null,
+              data_emissao: xmlTag(xmlContent, "dhEmi") || null,
+              valor_total: parseFloat(xmlTag(xmlContent, "vNF")) || null,
+              cnpj_emitente: xmlTag(xmlContent, "CNPJ") || null,
+              nome_emitente: xmlTag(xmlContent, "xNome") || null,
+              status_sefaz: "recebida",
+              nsu: nsuVal,
+              tipo_documento: isResumo ? "resumo" : "completo",
+              xml_completo: xmlContent.slice(0, 50000),
+            });
           }
-
-        } else if (schema.startsWith("procNFe")) {
-          const chNFe = xmlTag(xmlDoc, "chNFe") || (() => { const m = xmlDoc.match(/chNFe="([^"]{44})"/); return m ? m[1] : ""; })();
-          const emitCnpj = xmlTag(xmlDoc, "CNPJ");
-          const xNome = xmlTag(xmlDoc, "xNome");
-          const dhEmi = xmlTag(xmlDoc, "dhEmi");
-          const nNF = xmlTag(xmlDoc, "nNF");
-          const serie = xmlTag(xmlDoc, "serie");
-          const vNF = xmlTag(xmlDoc, "vNF");
-          if (!chNFe) continue;
-
-          const xmlPath = `${empresa_id}/nfe/${chNFe}.xml`;
-          await supabase.storage.from("nfe-xmls").upload(xmlPath, Buffer.from(xmlDoc), { contentType: "application/xml", upsert: true });
-
-          const { data: existingNF } = await supabase.from("notas_fiscais").select("id").eq("chave_acesso", chNFe).eq("empresa_id", empresa_id).maybeSingle();
-
-          let entidadeId = null;
-          if (emitCnpj) {
-            const { data: ent } = await supabase.from("entidades").select("id").eq("empresa_id", empresa_id).eq("cnpj_cpf", emitCnpj).maybeSingle();
-            if (ent) { entidadeId = ent.id; }
-            else if (xNome) { const { data: ne } = await supabase.from("entidades").insert({ empresa_id, razao_social: xNome, cnpj_cpf: emitCnpj, tipo: "fornecedor", ativo: true }).select("id").single(); if (ne) entidadeId = ne.id; }
-          }
-
-          let nfId = existingNF?.id ?? null;
-          if (existingNF) {
-            await supabase.from("notas_fiscais").update({ numero_nf: nNF || null, serie: serie || null, valor_total_nf: vNF ? parseFloat(vNF) : null, xml_storage_path: xmlPath, tipo_documento: "nfe", processado: true, entidade_id: entidadeId }).eq("id", existingNF.id);
-          } else {
-            const { data: ins } = await supabase.from("notas_fiscais").insert({ empresa_id, chave_acesso: chNFe, emit_cnpj: emitCnpj || null, emit_razao_social: xNome || null, data_emissao: dhEmi || null, numero_nf: nNF || null, serie: serie || null, valor_total_nf: vNF ? parseFloat(vNF) : null, entidade_id: entidadeId, origem: "sefaz", tipo_documento: "nfe", xml_storage_path: xmlPath, processado: true, status_manifestacao: "pendente" }).select("id").single();
-            nfId = ins?.id ?? null;
-            notasNovas++;
-          }
-
-          if (nfId) {
-            const detMatches = [...xmlDoc.matchAll(/<det\b[^>]*>([\s\S]*?)<\/det>/gi)];
-            const itens = detMatches.map((d) => {
-              const prod = d[1];
-              return { empresa_id, nota_fiscal_id: nfId, descricao: xmlTag(prod, "xProd"), ncm: xmlTag(prod, "NCM") || null, cfop: xmlTag(prod, "CFOP") || null, quantidade: parseFloat(xmlTag(prod, "qCom") || "0") || null, valor_unitario: parseFloat(xmlTag(prod, "vUnCom") || "0") || null, valor_total: parseFloat(xmlTag(prod, "vProd") || "0") || null };
-            }).filter((i) => i.descricao);
-            if (itens.length > 0) {
-              await supabase.from("itens_nf").delete().eq("nota_fiscal_id", nfId);
-              await supabase.from("itens_nf").insert(itens);
-            }
-          }
-          console.log(`[sync] + NF-e: ${chNFe.slice(-10)} | NF ${nNF} | ${xNome} | R$ ${vNF}`);
+        } catch (docErr) {
+          console.error(`[sync] Erro processando doc: ${docErr.message}`);
         }
-      } catch (e) {
-        errors.push(`Erro processar (${schema}): ${e.message}`);
       }
+
+      await supabase.from("empresas").update({ sefaz_ultimo_nsu: ultNSU }).eq("id", empresa_id);
+
+      if (ultNSU >= maxNSU) break;
+    } else if (cStat === "656") {
+      return res.json({ success: true, data: { message: "Consumo indevido. Aguarde.", cStat, xMotivo, totalDocs, ultNSU } });
+    } else {
+      return res.json({ success: false, data: { cStat, xMotivo, totalDocs, ultNSU } });
     }
-
-    if (ultNsuResp) ultNSU = ultNsuResp;
-    if (!maxNsuResp || pad15(ultNSU) >= pad15(maxNSU)) shouldStop = true;
   }
 
-  // Status final
-  const temErros = errors.length > 0;
-  const logStatus = !temErros ? "sucesso" : (temErros && notasEncontradas > 0) ? "erro_parcial" : "erro";
-  let mensagemLog = nenhumDocumento && notasNovas === 0 ? "Nenhuma NF-e nova encontrada na SEFAZ." : consumoIndevido ? errors[0] : temErros ? errors[0] : `Sincronização concluída. ${notasNovas} nota(s) nova(s) importada(s).`;
-
-  console.log(`[sync] ${logStatus} | Encontradas: ${notasEncontradas} | Novas: ${notasNovas}`);
-
-  // Atualizar controle_sync
-  const ctrlData = { empresa_id, tipo: "sefaz", ultimo_nsu: pad15(ultNSU), ultima_execucao: new Date().toISOString(), status: !temErros ? "idle" : "erro", total_notas_sync: notasEncontradas, erro_ultima_sync: temErros ? mensagemLog : null, updated_at: new Date().toISOString() };
-  if (ctrlSyncId) { await supabase.from("controle_sync").update(ctrlData).eq("id", ctrlSyncId); }
-  else { await supabase.from("controle_sync").insert(ctrlData); }
-
-  // Log
-  await supabase.from("log_sync_sefaz").insert({ empresa_id, tipo: "dist_dfe", status: logStatus, nsu_inicio: "0", nsu_fim: pad15(ultNSU), notas_encontradas: notasEncontradas, notas_novas: notasNovas, mensagem: mensagemLog, detalhes: { loops, ambiente, max_nsu: maxNSU, errors, consumo_indevido: consumoIndevido, nenhum_documento: nenhumDocumento } });
-
-  // Alerta
-  if (notasNovas > 0) {
-    await supabase.from("alertas").insert({ empresa_id, tipo: "nfe_nova", severidade: "info", titulo: `${notasNovas} nova(s) NF-e recebida(s) da SEFAZ`, mensagem: `${notasNovas} nota(s) fiscal(is) nova(s) importadas via proxy SEFAZ.`, lido: false });
-  }
-
-  return res.json({ success: true, data: { notas_encontradas: notasEncontradas, notas_novas: notasNovas, ultimo_nsu: pad15(ultNSU), max_nsu: pad15(maxNSU), loops, errors, nenhum_documento: nenhumDocumento, consumo_indevido: consumoIndevido, parcial: temErros && notasEncontradas > 0 } });
+  return res.json({ success: true, data: { totalDocs, ultNSU, maxNSU, loops } });
 });
 
 // ══════════════════════════════════════════════════════
@@ -428,27 +425,47 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
   if (!tipo_manifestacao) return res.status(400).json({ success: false, error: "tipo_manifestacao obrigatório" });
 
   const manifestacao = MANIFESTACAO[tipo_manifestacao];
-  if (!manifestacao) return res.status(400).json({ success: false, error: `tipo_manifestacao inválido` });
-  if (tipo_manifestacao === "nao_realizada" && (!justificativa || justificativa.trim().length < 15)) return res.status(400).json({ success: false, error: "Justificativa obrigatória (min 15 chars)" });
+  if (!manifestacao) return res.status(400).json({ success: false, error: "tipo_manifestacao inválido" });
+  if (tipo_manifestacao === "nao_realizada" && (!justificativa || justificativa.trim().length < 15))
+    return res.status(400).json({ success: false, error: "Justificativa obrigatória (min 15 chars)" });
 
   const tpAmb = ambiente === "homologacao" ? "2" : "1";
   const sefazUrl = SEFAZ_URLS.recepcao_evento[ambiente] || SEFAZ_URLS.recepcao_evento.producao;
   const supabase = getSupabaseAdmin();
 
-  const { data: empresa } = await supabase.from("empresas").select("id, cnpj, sefaz_ativo").eq("id", empresa_id).single();
+  const { data: empresa } = await supabase
+    .from("empresas").select("id, cnpj, sefaz_ativo")
+    .eq("id", empresa_id).single();
   if (!empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
   if (!empresa.sefaz_ativo) return res.status(400).json({ success: false, error: "SEFAZ não ativa" });
   const cnpj = empresa.cnpj.replace(/\D/g, "");
 
-  const { data: nf } = await supabase.from("notas_fiscais").select("id, chave_acesso").eq("id", nota_fiscal_id).eq("empresa_id", empresa_id).single();
+  const { data: nf } = await supabase
+    .from("notas_fiscais").select("id, chave_acesso")
+    .eq("id", nota_fiscal_id).eq("empresa_id", empresa_id).single();
   if (!nf) return res.status(404).json({ success: false, error: "NF não encontrada" });
   if (!nf.chave_acesso) return res.status(400).json({ success: false, error: "NF sem chave de acesso" });
 
-  const { data: cert } = await supabase.from("certificados_digitais").select("cert_pem, key_pem, data_validade").eq("empresa_id", empresa_id).eq("ativo", true).order("created_at", { ascending: false }).limit(1).maybeSingle();
-  if (!cert || !cert.cert_pem || !cert.key_pem) return res.status(404).json({ success: false, error: "Certificado não configurado" });
-  if (cert.data_validade && new Date(cert.data_validade) < new Date()) return res.status(400).json({ success: false, error: "Certificado expirado" });
+  const { data: cert } = await supabase
+    .from("certificados_digitais").select("cert_pem, key_pem, data_validade")
+    .eq("empresa_id", empresa_id).eq("ativo", true)
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!cert || !cert.cert_pem || !cert.key_pem)
+    return res.status(404).json({ success: false, error: "Certificado não configurado" });
+  if (cert.data_validade && new Date(cert.data_validade) < new Date())
+    return res.status(400).json({ success: false, error: "Certificado expirado" });
 
-  const soap = buildManifestacaoSoap(nf.chave_acesso, cnpj, tpAmb, manifestacao.codigo, manifestacao.descricao, tipo_manifestacao === "nao_realizada" ? justificativa.trim() : undefined);
+  let soap;
+  try {
+    soap = buildManifestacaoSoap(
+      nf.chave_acesso, cnpj, tpAmb, manifestacao.codigo, manifestacao.descricao,
+      tipo_manifestacao === "nao_realizada" ? justificativa.trim() : undefined,
+      cert.cert_pem, cert.key_pem
+    );
+  } catch (e) {
+    console.error(`[manifestar] Erro ao construir SOAP: ${e.message}`);
+    return res.status(500).json({ success: false, error: `Erro assinatura: ${e.message}` });
+  }
 
   let respText;
   try {
@@ -478,30 +495,49 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
 
 // ══════════════════════════════════════════════════════
 // MANIFESTAR POR CHAVE — POST /api/manifestar-por-chave
-// (Permite manifestar sem ter a NF-e no banco - útil para ativar DistDFe)
 // ══════════════════════════════════════════════════════
 app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
   const { empresa_id, chave_acesso, tipo_manifestacao = "ciencia", justificativa, ambiente = "producao" } = req.body;
   if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id obrigatório" });
-  if (!chave_acesso || chave_acesso.replace(/\D/g, "").length !== 44) return res.status(400).json({ success: false, error: "chave_acesso inválida (44 dígitos)" });
+  if (!chave_acesso || chave_acesso.replace(/\D/g, "").length !== 44)
+    return res.status(400).json({ success: false, error: "chave_acesso inválida (44 dígitos)" });
 
   const manifestacao = MANIFESTACAO[tipo_manifestacao];
   if (!manifestacao) return res.status(400).json({ success: false, error: "tipo_manifestacao inválido" });
-  if (tipo_manifestacao === "nao_realizada" && (!justificativa || justificativa.trim().length < 15)) return res.status(400).json({ success: false, error: "Justificativa obrigatória (min 15 chars)" });
+  if (tipo_manifestacao === "nao_realizada" && (!justificativa || justificativa.trim().length < 15))
+    return res.status(400).json({ success: false, error: "Justificativa obrigatória (min 15 chars)" });
 
   const tpAmb = ambiente === "homologacao" ? "2" : "1";
   const sefazUrl = SEFAZ_URLS.recepcao_evento[ambiente] || SEFAZ_URLS.recepcao_evento.producao;
   const supabase = getSupabaseAdmin();
 
-  const { data: empresa } = await supabase.from("empresas").select("id, cnpj, sefaz_ativo").eq("id", empresa_id).single();
+  const { data: empresa } = await supabase
+    .from("empresas").select("id, cnpj, sefaz_ativo")
+    .eq("id", empresa_id).single();
   if (!empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
   const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
 
-  const { data: cert } = await supabase.from("certificados_digitais").select("cert_pem, key_pem").eq("empresa_id", empresa_id).eq("ativo", true).order("created_at", { ascending: false }).limit(1).maybeSingle();
-  if (!cert || !cert.cert_pem || !cert.key_pem) return res.status(404).json({ success: false, error: "Certificado não configurado" });
+  const { data: cert } = await supabase
+    .from("certificados_digitais").select("cert_pem, key_pem")
+    .eq("empresa_id", empresa_id).eq("ativo", true)
+    .order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!cert || !cert.cert_pem || !cert.key_pem)
+    return res.status(404).json({ success: false, error: "Certificado não configurado" });
 
   const chave = chave_acesso.replace(/\D/g, "");
-  const soap = buildManifestacaoSoap(chave, cnpj, tpAmb, manifestacao.codigo, manifestacao.descricao, tipo_manifestacao === "nao_realizada" ? justificativa.trim() : undefined);
+
+  let soap;
+  try {
+    soap = buildManifestacaoSoap(
+      chave, cnpj, tpAmb, manifestacao.codigo, manifestacao.descricao,
+      tipo_manifestacao === "nao_realizada" ? justificativa.trim() : undefined,
+      cert.cert_pem, cert.key_pem
+    );
+  } catch (e) {
+    console.error(`[manifestar-chave] Erro ao construir SOAP/assinar: ${e.message}`);
+    console.error(e.stack);
+    return res.status(500).json({ success: false, error: `Erro assinatura: ${e.message}` });
+  }
 
   let respText;
   try {
@@ -527,7 +563,14 @@ app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
 
   return res.json({
     success: sucesso,
-    data: { cStat, xMotivo, nProt: nProt || null, chave_acesso: chave, tipo_manifestacao, soap_enviado: soap, resposta_completa: respText }
+    data: {
+      cStat, xMotivo,
+      nProt: nProt || null,
+      chave_acesso: chave,
+      tipo_manifestacao,
+      soap_enviado: soap,
+      resposta_completa: respText,
+    },
   });
 });
 
