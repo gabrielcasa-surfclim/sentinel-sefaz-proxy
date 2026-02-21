@@ -51,13 +51,16 @@ const MANIFESTACAO = {
   nao_realizada: { codigo: "210240", descricao: "Operacao nao Realizada" },
 };
 
-function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000, extraHeaders = {}) {
+function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000, soapAction = null) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
+    let contentType = "application/soap+xml; charset=utf-8";
+    if (soapAction) {
+      contentType = `application/soap+xml; charset=utf-8; action="${soapAction}"`;
+    }
     const headers = {
-      "Content-Type": "application/soap+xml; charset=utf-8",
+      "Content-Type": contentType,
       "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
-      ...extraHeaders,
     };
     const options = {
       hostname: parsed.hostname, port: 443, path: parsed.pathname, method: "POST",
@@ -208,7 +211,7 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
   let respText;
   try {
     console.log(`[consulta-chave] Chave: ${chave} | CNPJ: ${cnpj}`);
-    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, {"SOAPAction": "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento"});
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento");
     respText = resp.body;
     console.log(`[consulta-chave] HTTP ${resp.status}`);
   } catch (e) {
@@ -274,7 +277,7 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
     let respText;
     try {
       console.log(`[sync] Loop ${loops} | NSU: ${pad15(ultNSU)} | ${empresa.razao_social}`);
-      const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, {"SOAPAction": "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento"});
+      const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento");
       respText = resp.body;
       console.log(`[sync] SEFAZ HTTP ${resp.status}`);
     } catch (e) {
@@ -443,7 +446,7 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
   let respText;
   try {
     console.log(`[manifestar] ${tipo_manifestacao} | NF: ${nf.chave_acesso.slice(-10)}`);
-    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, {"SOAPAction": "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento"});
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento");
     respText = resp.body;
   } catch (e) {
     return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}` });
@@ -495,7 +498,7 @@ app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
   let respText;
   try {
     console.log(`[manifestar-chave] ${tipo_manifestacao} | Chave: ${chave} | CNPJ: ${cnpj}`);
-    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, {"SOAPAction": "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento"});
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem, 30000, "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento");
     respText = resp.body;
     console.log(`[manifestar-chave] HTTP ${resp.status}`);
   } catch (e) {
