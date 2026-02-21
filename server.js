@@ -91,6 +91,32 @@ function xmlTag(xml, tag) {
   return m ? m[1].trim() : "";
 }
 
+// Extrai dados do retEvento (resultado individual do evento dentro do lote)
+// A SEFAZ retorna cStat 128 no lote e cStat 135/136 dentro do retEvento
+function parseRetEvento(respXml) {
+  const retEvento = respXml.match(/<retEvento[\s\S]*?<\/retEvento>/i);
+  if (!retEvento) {
+    // Fallback: pega do nível do lote
+    return {
+      cStat: xmlTag(respXml, "cStat"),
+      xMotivo: xmlTag(respXml, "xMotivo"),
+      nProt: xmlTag(respXml, "nProt") || null,
+      chNFe: xmlTag(respXml, "chNFe") || null,
+    };
+  }
+  const ret = retEvento[0];
+  return {
+    cStat: xmlTag(ret, "cStat"),
+    xMotivo: xmlTag(ret, "xMotivo"),
+    nProt: xmlTag(ret, "nProt") || null,
+    chNFe: xmlTag(ret, "chNFe") || null,
+    tpEvento: xmlTag(ret, "tpEvento") || null,
+    xEvento: xmlTag(ret, "xEvento") || null,
+    nSeqEvento: xmlTag(ret, "nSeqEvento") || null,
+    dhRegEvento: xmlTag(ret, "dhRegEvento") || null,
+  };
+}
+
 function pad15(nsu) {
   return (nsu || "0").replace(/\D/g, "").padStart(15, "0");
 }
@@ -477,20 +503,19 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
     return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}` });
   }
 
-  const cStat = xmlTag(respText, "cStat");
-  const xMotivo = xmlTag(respText, "xMotivo");
-  const nProt = xmlTag(respText, "nProt");
-  const sucesso = cStat === "135" || cStat === "136";
+  const cStatLote = xmlTag(respText, "cStat");
+  const evento = parseRetEvento(respText);
+  const sucesso = evento.cStat === "135" || evento.cStat === "136";
 
-  console.log(`[manifestar] cStat: ${cStat} | sucesso: ${sucesso}`);
+  console.log(`[manifestar] Lote cStat: ${cStatLote} | Evento cStat: ${evento.cStat} | ${evento.xMotivo} | sucesso: ${sucesso}`);
 
   if (sucesso) {
     await supabase.from("notas_fiscais").update({ status_manifestacao: tipo_manifestacao }).eq("id", nota_fiscal_id);
-    return res.json({ success: true, data: { cStat, xMotivo, nProt, status_manifestacao: tipo_manifestacao, nota_fiscal_id } });
+    return res.json({ success: true, data: { cStat: evento.cStat, xMotivo: evento.xMotivo, nProt: evento.nProt, dhRegEvento: evento.dhRegEvento, status_manifestacao: tipo_manifestacao, nota_fiscal_id } });
   }
 
   const msgErros = { "573": "Manifestação já registrada.", "217": "NF-e não consta na SEFAZ.", "656": "Consumo indevido." };
-  return res.status(422).json({ success: false, error: msgErros[cStat] || `SEFAZ erro ${cStat}: ${xMotivo}`, cStat, xMotivo });
+  return res.status(422).json({ success: false, error: msgErros[evento.cStat] || `SEFAZ erro ${evento.cStat}: ${evento.xMotivo}`, cStat: evento.cStat, xMotivo: evento.xMotivo });
 });
 
 // ══════════════════════════════════════════════════════
@@ -554,22 +579,21 @@ app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
     return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}` });
   }
 
-  const cStat = xmlTag(respText, "cStat");
-  const xMotivo = xmlTag(respText, "xMotivo");
-  const nProt = xmlTag(respText, "nProt");
-  const sucesso = cStat === "135" || cStat === "136";
+  const cStatLote = xmlTag(respText, "cStat");
+  const evento = parseRetEvento(respText);
+  const sucesso = evento.cStat === "135" || evento.cStat === "136";
 
-  console.log(`[manifestar-chave] cStat: ${cStat} | ${xMotivo} | sucesso: ${sucesso}`);
+  console.log(`[manifestar-chave] Lote cStat: ${cStatLote} | Evento cStat: ${evento.cStat} | ${evento.xMotivo} | sucesso: ${sucesso}`);
 
   return res.json({
     success: sucesso,
     data: {
-      cStat, xMotivo,
-      nProt: nProt || null,
+      cStat: evento.cStat,
+      xMotivo: evento.xMotivo,
+      nProt: evento.nProt,
+      dhRegEvento: evento.dhRegEvento,
       chave_acesso: chave,
       tipo_manifestacao,
-      soap_enviado: soap,
-      resposta_completa: respText,
     },
   });
 });
