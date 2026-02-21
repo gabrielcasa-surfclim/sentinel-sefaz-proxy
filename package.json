@@ -1,0 +1,19 @@
+{
+  "name": "sentinel-sefaz-proxy",
+  "version": "1.0.0",
+  "description": "Proxy API para comunicação mTLS com SEFAZ - Sentinel Finance",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "xml2js": "^0.6.2",
+    "pako": "^2.1.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "dotenv": "^16.4.5",
+    "node-forge": "^1.3.1"
+  }
+}
