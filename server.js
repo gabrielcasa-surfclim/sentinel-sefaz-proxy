@@ -460,6 +460,57 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+// MANIFESTAR POR CHAVE — POST /api/manifestar-por-chave
+// (Permite manifestar sem ter a NF-e no banco - útil para ativar DistDFe)
+// ══════════════════════════════════════════════════════
+app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
+  const { empresa_id, chave_acesso, tipo_manifestacao = "ciencia", justificativa, ambiente = "producao" } = req.body;
+  if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id obrigatório" });
+  if (!chave_acesso || chave_acesso.replace(/\D/g, "").length !== 44) return res.status(400).json({ success: false, error: "chave_acesso inválida (44 dígitos)" });
+
+  const manifestacao = MANIFESTACAO[tipo_manifestacao];
+  if (!manifestacao) return res.status(400).json({ success: false, error: "tipo_manifestacao inválido" });
+  if (tipo_manifestacao === "nao_realizada" && (!justificativa || justificativa.trim().length < 15)) return res.status(400).json({ success: false, error: "Justificativa obrigatória (min 15 chars)" });
+
+  const tpAmb = ambiente === "homologacao" ? "2" : "1";
+  const sefazUrl = SEFAZ_URLS.recepcao_evento[ambiente] || SEFAZ_URLS.recepcao_evento.producao;
+  const supabase = getSupabaseAdmin();
+
+  const { data: empresa } = await supabase.from("empresas").select("id, cnpj, sefaz_ativo").eq("id", empresa_id).single();
+  if (!empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
+  const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
+
+  const { data: cert } = await supabase.from("certificados_digitais").select("cert_pem, key_pem").eq("empresa_id", empresa_id).eq("ativo", true).order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!cert || !cert.cert_pem || !cert.key_pem) return res.status(404).json({ success: false, error: "Certificado não configurado" });
+
+  const chave = chave_acesso.replace(/\D/g, "");
+  const soap = buildManifestacaoSoap(chave, cnpj, tpAmb, manifestacao.codigo, manifestacao.descricao, tipo_manifestacao === "nao_realizada" ? justificativa.trim() : undefined);
+
+  let respText;
+  try {
+    console.log(`[manifestar-chave] ${tipo_manifestacao} | Chave: ${chave} | CNPJ: ${cnpj}`);
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
+    respText = resp.body;
+    console.log(`[manifestar-chave] HTTP ${resp.status}`);
+  } catch (e) {
+    return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}` });
+  }
+
+  const cStat = xmlTag(respText, "cStat");
+  const xMotivo = xmlTag(respText, "xMotivo");
+  const nProt = xmlTag(respText, "nProt");
+  const sucesso = cStat === "135" || cStat === "136";
+
+  console.log(`[manifestar-chave] cStat: ${cStat} | ${xMotivo} | sucesso: ${sucesso}`);
+  console.log(`[manifestar-chave] Resposta raw: ${respText.slice(0, 500)}`);
+
+  return res.json({
+    success: sucesso,
+    data: { cStat, xMotivo, nProt: nProt || null, chave_acesso: chave, tipo_manifestacao, resposta_raw: respText.slice(0, 1000) }
+  });
+});
+
+// ══════════════════════════════════════════════════════
 // START
 // ══════════════════════════════════════════════════════
 app.listen(PORT, () => {
