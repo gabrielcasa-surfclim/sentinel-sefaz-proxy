@@ -62,10 +62,15 @@ function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000, soapAct
       "Content-Type": contentType,
       "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
     };
+    if (soapAction) {
+      headers["SOAPAction"] = `"${soapAction}"`;
+    }
     const options = {
       hostname: parsed.hostname, port: 443, path: parsed.pathname, method: "POST",
       headers, cert: certPem, key: keyPem, rejectUnauthorized: true, timeout: timeoutMs,
     };
+    console.log(`[sefazRequest] URL: ${url}`);
+    console.log(`[sefazRequest] Headers: ${JSON.stringify(headers)}`);
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
@@ -130,10 +135,14 @@ function buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU) {
 function buildManifestacaoSoap(chNFe, cnpj, tpAmb, codigoEvento, descEvento, justificativa) {
   const dh = dhEvento();
   const nSeqEvento = "1";
+  const seqPadded = nSeqEvento.padStart(2, "0");
+  const eventoId = `ID${codigoEvento}${chNFe}${seqPadded}`;
+  console.log(`[buildManifestacao] Id gerado: ${eventoId} (length: ${eventoId.length})`);
+  console.log(`[buildManifestacao] tpEvento: ${codigoEvento} | chNFe: ${chNFe} (${chNFe.length}) | seq: ${seqPadded}`);
   const detEvento = justificativa
     ? `<detEvento versao="1.00"><descEvento>${descEvento}</descEvento><justificativa>${justificativa}</justificativa></detEvento>`
     : `<detEvento versao="1.00"><descEvento>${descEvento}</descEvento></detEvento>`;
-  const eventoXml = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><infEvento Id="ID${codigoEvento}${chNFe}${nSeqEvento.padStart(2,"0")}"><cOrgao>91</cOrgao><tpAmb>${tpAmb}</tpAmb><CNPJ>${cnpj}</CNPJ><chNFe>${chNFe}</chNFe><dhEvento>${dh}</dhEvento><tpEvento>${codigoEvento}</tpEvento><nSeqEvento>${nSeqEvento}</nSeqEvento><verEvento>1.00</verEvento>${detEvento}</infEvento></evento>`;
+  const eventoXml = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><infEvento Id="${eventoId}"><cOrgao>91</cOrgao><tpAmb>${tpAmb}</tpAmb><CNPJ>${cnpj}</CNPJ><chNFe>${chNFe}</chNFe><dhEvento>${dh}</dhEvento><tpEvento>${codigoEvento}</tpEvento><nSeqEvento>${nSeqEvento}</nSeqEvento><verEvento>1.00</verEvento>${detEvento}</infEvento></evento>`;
 
   const envioLote = `<envEvento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><idLote>1</idLote>${eventoXml}</envEvento>`;
 
