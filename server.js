@@ -51,13 +51,17 @@ const MANIFESTACAO = {
   nao_realizada: { codigo: "210240", descricao: "Operacao nao Realizada" },
 };
 
-function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000) {
+function sefazRequest(url, soapBody, certPem, keyPem, timeoutMs = 30000, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
+    const headers = {
+      "Content-Type": "application/soap+xml; charset=utf-8",
+      "Content-Length": Buffer.byteLength(soapBody, "utf-8"),
+      ...extraHeaders,
+    };
     const options = {
       hostname: parsed.hostname, port: 443, path: parsed.pathname, method: "POST",
-      headers: { "Content-Type": "application/soap+xml; charset=utf-8", "Content-Length": Buffer.byteLength(soapBody, "utf-8") },
-      cert: certPem, key: keyPem, rejectUnauthorized: true, timeout: timeoutMs,
+      headers, cert: certPem, key: keyPem, rejectUnauthorized: true, timeout: timeoutMs,
     };
     const req = https.request(options, (res) => {
       let data = "";
@@ -128,11 +132,13 @@ function buildManifestacaoSoap(chNFe, cnpj, tpAmb, codigoEvento, descEvento, jus
     : `<detEvento versao="1.00"><descEvento>${descEvento}</descEvento></detEvento>`;
   const eventoXml = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><infEvento Id="ID${codigoEvento}${chNFe}${nSeqEvento.padStart(2,"0")}"><cOrgao>91</cOrgao><tpAmb>${tpAmb}</tpAmb><CNPJ>${cnpj}</CNPJ><chNFe>${chNFe}</chNFe><dhEvento>${dh}</dhEvento><tpEvento>${codigoEvento}</tpEvento><nSeqEvento>${nSeqEvento}</nSeqEvento><verEvento>1.00</verEvento>${detEvento}</infEvento></evento>`;
 
+  const envioLote = `<envEvento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><idLote>1</idLote>${eventoXml}</envEvento>`;
+
   return `<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
   <soap12:Body>
     <nfeRecepcaoEvento xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4">
-      <nfeDadosMsg>${eventoXml}</nfeDadosMsg>
+      <nfeDadosMsg>${envioLote}</nfeDadosMsg>
     </nfeRecepcaoEvento>
   </soap12:Body>
 </soap12:Envelope>`;
