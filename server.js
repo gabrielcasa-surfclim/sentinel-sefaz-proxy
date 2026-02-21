@@ -157,6 +157,72 @@ app.get("/health", (_req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+// CONSULTA POR CHAVE — POST /api/consulta-chave
+// ══════════════════════════════════════════════════════
+app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
+  const { empresa_id, chave_acesso, ambiente = "producao" } = req.body;
+  if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id obrigatório" });
+  if (!chave_acesso || chave_acesso.replace(/\D/g, "").length !== 44) return res.status(400).json({ success: false, error: "chave_acesso inválida (44 dígitos)" });
+
+  const tpAmb = ambiente === "homologacao" ? "2" : "1";
+  const sefazUrl = SEFAZ_URLS.dist_dfe[ambiente] || SEFAZ_URLS.dist_dfe.producao;
+  const supabase = getSupabaseAdmin();
+
+  const { data: empresa } = await supabase.from("empresas").select("id, cnpj, uf, sefaz_ativo").eq("id", empresa_id).single();
+  if (!empresa) return res.status(404).json({ success: false, error: "Empresa não encontrada" });
+
+  const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
+  const uf = (empresa.uf || "").toUpperCase().trim();
+  const ufCode = UF_CODE[uf];
+  if (!ufCode) return res.status(400).json({ success: false, error: "UF inválida" });
+
+  const { data: cert } = await supabase.from("certificados_digitais").select("cert_pem, key_pem").eq("empresa_id", empresa_id).eq("ativo", true).order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (!cert || !cert.cert_pem || !cert.key_pem) return res.status(404).json({ success: false, error: "Certificado não configurado" });
+
+  const chave = chave_acesso.replace(/\D/g, "");
+
+  const body = `<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
+  <tpAmb>${tpAmb}</tpAmb>
+  <cUFAutor>${ufCode}</cUFAutor>
+  <CNPJ>${cnpj}</CNPJ>
+  <consChNFe>
+    <chNFe>${chave}</chNFe>
+  </consChNFe>
+</distDFeInt>`;
+
+  const soap = `<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap12="http://www.w3.org/2003/05/soap-envelope">
+  <soap12:Body>
+    <nfeDistDFeInteresse xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+      <nfeDadosMsg>${body}</nfeDadosMsg>
+    </nfeDistDFeInteresse>
+  </soap12:Body>
+</soap12:Envelope>`;
+
+  let respText;
+  try {
+    console.log(`[consulta-chave] Chave: ${chave} | CNPJ: ${cnpj}`);
+    const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
+    respText = resp.body;
+    console.log(`[consulta-chave] HTTP ${resp.status}`);
+  } catch (e) {
+    return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}` });
+  }
+
+  const cStat = xmlTag(respText, "cStat");
+  const xMotivo = xmlTag(respText, "xMotivo");
+
+  console.log(`[consulta-chave] cStat: ${cStat} | ${xMotivo}`);
+
+  // Retornar resposta raw para debug
+  const retMatch = respText.match(/<retDistDFeInt[\s\S]*?<\/retDistDFeInt>/i);
+  return res.json({
+    success: cStat === "138",
+    data: { cStat, xMotivo, chave_acesso: chave, retXml: retMatch ? retMatch[0].slice(0, 2000) : null }
+  });
+});
+
+// ══════════════════════════════════════════════════════
 // SYNC SEFAZ — POST /api/sync-sefaz
 // ══════════════════════════════════════════════════════
 app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
