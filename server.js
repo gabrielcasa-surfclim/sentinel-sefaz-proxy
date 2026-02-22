@@ -328,6 +328,23 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+// HELPER: Extrair parcelas (duplicatas) do XML da NF-e
+// ══════════════════════════════════════════════════════
+function extrairParcelas(xmlContent) {
+  const parcelas = [];
+  const dupMatches = xmlContent.match(/<dup>([\s\S]*?)<\/dup>/gi) || [];
+  dupMatches.forEach((dup, index) => {
+    const nDup = xmlTag(dup, "nDup") || String(index + 1);
+    const dVenc = xmlTag(dup, "dVenc");
+    const vDup = parseFloat(xmlTag(dup, "vDup"));
+    if (dVenc && vDup > 0) {
+      parcelas.push({ nDup, vencimento: dVenc, valor: vDup, index: index + 1 });
+    }
+  });
+  return parcelas;
+}
+
+// ══════════════════════════════════════════════════════
 // HELPER: Salvar log e controle de sync
 // ══════════════════════════════════════════════════════
 async function salvarSyncLog(supabase, empresaId, status, notasEncontradas, notasNovas, nsuInicio, nsuFim, mensagem) {
@@ -506,7 +523,7 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
               tipoDoc = "outro";
             }
 
-            const { error: insertErr } = await supabase.from("notas_fiscais").insert({
+            const { data: insertedNF, error: insertErr } = await supabase.from("notas_fiscais").insert({
               empresa_id,
               chave_acesso: chNFe,
               numero_nf: numero,
@@ -519,9 +536,67 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
               nsu: nsuVal,
               tipo_documento: tipoDoc,
               xml_completo: xmlContent.slice(0, 50000),
-            });
-            if (!insertErr) notasNovas++;
-            else errors.push(`Erro ao inserir NF ${chNFe.slice(-10)}: ${insertErr.message}`);
+              origem: "sefaz",
+            }).select("id").single();
+
+            if (!insertErr && insertedNF) {
+              notasNovas++;
+
+              // ── Auto-gerar contas a pagar das parcelas (duplicatas) ──
+              if (isNFeProc) {
+                try {
+                  const parcelas = extrairParcelas(xmlContent);
+                  if (parcelas.length > 0) {
+                    const contasInsert = parcelas.map((p) => ({
+                      empresa_id,
+                      tipo: "pagar",
+                      status: "previsto",
+                      origem: "sefaz",
+                      descricao: `NF-e ${numero || ""} - ${nomeEmitente || ""} (${p.nDup}/${parcelas.length})`.trim(),
+                      valor_original: p.valor,
+                      data_vencimento: p.vencimento,
+                      data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
+                      nota_fiscal_id: insertedNF.id,
+                      parcela_numero: parseInt(p.nDup) || p.index,
+                      parcela_total: parcelas.length,
+                      documento_ref: chNFe,
+                    }));
+                    const { error: contasErr } = await supabase.from("contas").insert(contasInsert);
+                    if (contasErr) {
+                      console.error(`[sync] Erro ao criar contas: ${contasErr.message}`);
+                      errors.push(`Erro contas NF ${chNFe.slice(-10)}: ${contasErr.message}`);
+                    } else {
+                      console.log(`[sync] NF ${numero}: ${parcelas.length} conta(s) a pagar criada(s)`);
+                    }
+                  } else {
+                    // Sem parcelas no XML — criar 1 conta com valor total
+                    const { error: contaErr } = await supabase.from("contas").insert({
+                      empresa_id,
+                      tipo: "pagar",
+                      status: "previsto",
+                      origem: "sefaz",
+                      descricao: `NF-e ${numero || ""} - ${nomeEmitente || ""}`.trim(),
+                      valor_original: valorTotal || 0,
+                      data_vencimento: dataEmissao ? dataEmissao.split("T")[0] : new Date().toISOString().split("T")[0],
+                      data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
+                      nota_fiscal_id: insertedNF.id,
+                      parcela_numero: 1,
+                      parcela_total: 1,
+                      documento_ref: chNFe,
+                    });
+                    if (contaErr) {
+                      console.error(`[sync] Erro ao criar conta única: ${contaErr.message}`);
+                    } else {
+                      console.log(`[sync] NF ${numero}: 1 conta a pagar criada (sem parcelas no XML)`);
+                    }
+                  }
+                } catch (contaErr) {
+                  console.error(`[sync] Erro processando parcelas: ${contaErr.message}`);
+                }
+              }
+            } else if (insertErr) {
+              errors.push(`Erro ao inserir NF ${chNFe.slice(-10)}: ${insertErr.message}`);
+            }
           }
         } catch (docErr) {
           console.error(`[sync] Erro processando doc: ${docErr.message}`);
