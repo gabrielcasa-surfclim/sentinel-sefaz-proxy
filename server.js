@@ -328,10 +328,57 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+// HELPER: Salvar log e controle de sync
+// ══════════════════════════════════════════════════════
+async function salvarSyncLog(supabase, empresaId, status, notasEncontradas, notasNovas, nsuInicio, nsuFim, mensagem) {
+  try {
+    // Upsert controle_sync
+    const { data: existing } = await supabase
+      .from("controle_sync").select("id")
+      .eq("empresa_id", empresaId).eq("tipo", "sefaz").maybeSingle();
+
+    if (existing) {
+      await supabase.from("controle_sync").update({
+        ultima_execucao: new Date().toISOString(),
+        ultimo_nsu: nsuFim,
+        status,
+        total_notas_sync: notasNovas,
+        erro_ultima_sync: status === "erro" ? mensagem : null,
+        updated_at: new Date().toISOString(),
+      }).eq("id", existing.id);
+    } else {
+      await supabase.from("controle_sync").insert({
+        empresa_id: empresaId,
+        tipo: "sefaz",
+        ultima_execucao: new Date().toISOString(),
+        ultimo_nsu: nsuFim,
+        status,
+        total_notas_sync: notasNovas,
+        erro_ultima_sync: status === "erro" ? mensagem : null,
+      });
+    }
+
+    // Insert log
+    await supabase.from("log_sync_sefaz").insert({
+      empresa_id: empresaId,
+      tipo: "sync",
+      status,
+      notas_encontradas: notasEncontradas,
+      notas_novas: notasNovas,
+      nsu_inicio: nsuInicio,
+      nsu_fim: nsuFim,
+      mensagem,
+    });
+  } catch (e) {
+    console.error(`[salvarSyncLog] Erro: ${e.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════════════
 // SYNC SEFAZ — POST /api/sync-sefaz
 // ══════════════════════════════════════════════════════
 app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
-  const { empresa_id, ambiente = "producao" } = req.body;
+  const { empresa_id, ambiente = "producao", reset_nsu } = req.body;
   if (!empresa_id) return res.status(400).json({ success: false, error: "empresa_id obrigatório" });
 
   const tpAmb = ambiente === "homologacao" ? "2" : "1";
@@ -356,11 +403,14 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
   if (!cert || !cert.cert_pem || !cert.key_pem)
     return res.status(404).json({ success: false, error: "Certificado não configurado" });
 
-  let ultNSU = empresa.sefaz_ultimo_nsu || "0";
+  let ultNSU = reset_nsu ? "0" : (empresa.sefaz_ultimo_nsu || "0");
+  const nsuInicio = ultNSU;
   let maxNSU = "999999999999999";
   let totalDocs = 0;
+  let notasNovas = 0;
   let loops = 0;
-  const maxLoops = 5;
+  const maxLoops = req.body.max_loops || 5;
+  const errors = [];
 
   while (ultNSU < maxNSU && loops < maxLoops) {
     loops++;
@@ -371,7 +421,10 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
       const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
       respText = resp.body;
     } catch (e) {
-      return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}`, parcial: { totalDocs, ultNSU } });
+      errors.push(`Erro conexão: ${e.message}`);
+      // Salvar log e controle mesmo com erro
+      await salvarSyncLog(supabase, empresa_id, "erro", totalDocs, notasNovas, nsuInicio, ultNSU, `Erro conexão SEFAZ: ${e.message}`);
+      return res.status(502).json({ success: false, error: `Erro conexão SEFAZ: ${e.message}`, data: { notas_encontradas: totalDocs, notas_novas: notasNovas, ultimo_nsu: ultNSU, loops, errors } });
     }
 
     const cStat = xmlTag(respText, "cStat");
@@ -408,7 +461,7 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
             const schema = schemaMatch ? schemaMatch[1] : null;
             const isResumo = schema && schema.includes("resNFe");
 
-            await supabase.from("notas_fiscais").insert({
+            const { error: insertErr } = await supabase.from("notas_fiscais").insert({
               empresa_id,
               chave_acesso: chNFe,
               numero: xmlTag(xmlContent, "nNF") || null,
@@ -422,23 +475,32 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
               tipo_documento: isResumo ? "resumo" : "completo",
               xml_completo: xmlContent.slice(0, 50000),
             });
+            if (!insertErr) notasNovas++;
+            else errors.push(`Erro ao inserir NF ${chNFe.slice(-10)}: ${insertErr.message}`);
           }
         } catch (docErr) {
           console.error(`[sync] Erro processando doc: ${docErr.message}`);
+          errors.push(docErr.message);
         }
       }
 
       await supabase.from("empresas").update({ sefaz_ultimo_nsu: ultNSU }).eq("id", empresa_id);
 
-      if (ultNSU >= maxNSU) break;
+      if (cStat === "137" || ultNSU >= maxNSU) break; // 137 = nenhum doc pendente
     } else if (cStat === "656") {
-      return res.json({ success: true, data: { message: "Consumo indevido. Aguarde.", cStat, xMotivo, totalDocs, ultNSU } });
+      await salvarSyncLog(supabase, empresa_id, "erro", totalDocs, notasNovas, nsuInicio, ultNSU, "Consumo indevido. Aguarde 1h.");
+      return res.json({ success: true, data: { notas_encontradas: totalDocs, notas_novas: notasNovas, ultimo_nsu: ultNSU, max_nsu: maxNSU, loops, errors, consumo_indevido: true, nenhum_documento: false } });
     } else {
-      return res.json({ success: false, data: { cStat, xMotivo, totalDocs, ultNSU } });
+      await salvarSyncLog(supabase, empresa_id, "erro", totalDocs, notasNovas, nsuInicio, ultNSU, `SEFAZ ${cStat}: ${xMotivo}`);
+      return res.json({ success: false, error: `SEFAZ ${cStat}: ${xMotivo}`, data: { notas_encontradas: totalDocs, notas_novas: notasNovas, ultimo_nsu: ultNSU, loops, errors } });
     }
   }
 
-  return res.json({ success: true, data: { totalDocs, ultNSU, maxNSU, loops } });
+  const nenhum = totalDocs === 0 && notasNovas === 0;
+  const status = errors.length > 0 ? "parcial" : "sucesso";
+  await salvarSyncLog(supabase, empresa_id, status, totalDocs, notasNovas, nsuInicio, ultNSU, nenhum ? "Nenhum documento novo" : `${notasNovas} nota(s) nova(s) importada(s)`);
+
+  return res.json({ success: true, data: { notas_encontradas: totalDocs, notas_novas: notasNovas, ultimo_nsu: ultNSU, max_nsu: maxNSU, loops, errors, nenhum_documento: nenhum, parcial: errors.length > 0, consumo_indevido: false } });
 });
 
 // ══════════════════════════════════════════════════════
