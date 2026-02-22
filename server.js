@@ -6,6 +6,7 @@ const { URL } = require("url");
 const pako = require("pako");
 const { createClient } = require("@supabase/supabase-js");
 const { SignedXml } = require("xml-crypto");
+const cron = require("node-cron");
 
 const app = express();
 const PORT = process.env.PORT || 3333;
@@ -781,9 +782,247 @@ app.post("/api/manifestar-por-chave", authMiddleware, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════
+// AUTO-SYNC CRON — Sincroniza todas as empresas ativas
+// ══════════════════════════════════════════════════════
+async function autoSyncTodasEmpresas() {
+  console.log(`[cron] Iniciando sync automático: ${new Date().toISOString()}`);
+  const supabase = getSupabaseAdmin();
+
+  try {
+    // Buscar todas as empresas com SEFAZ ativo e certificado válido
+    const { data: empresas } = await supabase
+      .from("empresas")
+      .select("id, cnpj, uf, sefaz_ativo, sefaz_ultimo_nsu")
+      .eq("sefaz_ativo", true);
+
+    if (!empresas || empresas.length === 0) {
+      console.log("[cron] Nenhuma empresa com SEFAZ ativo");
+      return;
+    }
+
+    for (const empresa of empresas) {
+      try {
+        console.log(`[cron] Sincronizando empresa ${empresa.cnpj}...`);
+
+        // Verificar certificado válido
+        const { data: cert } = await supabase
+          .from("certificados_digitais").select("cert_pem, key_pem, data_validade")
+          .eq("empresa_id", empresa.id).eq("ativo", true)
+          .order("created_at", { ascending: false }).limit(1).maybeSingle();
+
+        if (!cert || !cert.cert_pem || !cert.key_pem) {
+          console.log(`[cron] Empresa ${empresa.cnpj}: sem certificado ativo`);
+          continue;
+        }
+
+        // Verificar se certificado não está expirado
+        if (cert.data_validade && new Date(cert.data_validade) < new Date()) {
+          console.log(`[cron] Empresa ${empresa.cnpj}: certificado expirado`);
+          continue;
+        }
+
+        const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
+        const ufCode = UF_CODES[empresa.uf] || "42";
+        const tpAmb = "1"; // Sempre produção no cron
+        const sefazUrl = SEFAZ_URLS.dist_dfe.producao;
+
+        let ultNSU = empresa.sefaz_ultimo_nsu || "0";
+        const nsuInicio = ultNSU;
+        let maxNSU = "999999999999999";
+        let totalDocs = 0;
+        let notasNovas = 0;
+        let loops = 0;
+        const maxLoops = 10; // Mais loops no cron (sem pressa)
+        const errors = [];
+
+        while (ultNSU < maxNSU && loops < maxLoops) {
+          loops++;
+          const soap = buildDistDFeSoap(cnpj, ufCode, tpAmb, ultNSU);
+
+          let respText;
+          try {
+            const resp = await sefazRequest(sefazUrl, soap, cert.cert_pem, cert.key_pem);
+            respText = resp.body;
+          } catch (e) {
+            console.error(`[cron] Empresa ${empresa.cnpj}: erro conexão: ${e.message}`);
+            break;
+          }
+
+          const cStat = xmlTag(respText, "cStat");
+          const newUltNSU = xmlTag(respText, "ultNSU");
+          const newMaxNSU = xmlTag(respText, "maxNSU");
+
+          console.log(`[cron] ${empresa.cnpj} loop ${loops}: cStat=${cStat} ultNSU=${newUltNSU}`);
+
+          if (cStat === "137" || cStat === "138") {
+            if (newUltNSU) ultNSU = newUltNSU;
+            if (newMaxNSU) maxNSU = newMaxNSU;
+
+            const docMatches = respText.match(/<docZip[\s\S]*?<\/docZip>/gi) || [];
+            totalDocs += docMatches.length;
+
+            for (const docZip of docMatches) {
+              try {
+                const nsuMatch = docZip.match(/NSU="(\d+)"/i);
+                const schemaMatch = docZip.match(/schema="([^"]+)"/i);
+                const b64 = docZip.replace(/<\/?docZip[^>]*>/gi, "").trim();
+                if (!b64) continue;
+
+                const xmlContent = decompressGzip(b64);
+                const schema = schemaMatch ? schemaMatch[1] : null;
+                const nsuVal = nsuMatch ? nsuMatch[1] : null;
+
+                const isResEvento = schema?.includes("resEvento") || xmlContent.includes("<resEvento");
+                if (isResEvento) continue;
+
+                const isResNFe = schema?.includes("resNFe") || xmlContent.includes("<resNFe");
+                const isNFeProc = schema?.includes("procNFe") || xmlContent.includes("<nfeProc");
+
+                const chNFe = xmlTag(xmlContent, "chNFe");
+                if (!chNFe) continue;
+
+                const existing = await supabase
+                  .from("notas_fiscais").select("id")
+                  .eq("empresa_id", empresa.id).eq("chave_acesso", chNFe).maybeSingle();
+
+                if (!existing?.data) {
+                  let numero, serie, dataEmissao, valorTotal, cnpjEmitente, nomeEmitente, tipoDoc;
+
+                  if (isNFeProc) {
+                    const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
+                    cnpjEmitente = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
+                    nomeEmitente = xmlTag(emitBlock, "xNome") || null;
+                    numero = xmlTag(xmlContent, "nNF") || null;
+                    serie = xmlTag(xmlContent, "serie") || null;
+                    dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+                    const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
+                    valorTotal = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
+                    tipoDoc = "completo";
+                  } else if (isResNFe) {
+                    cnpjEmitente = xmlTag(xmlContent, "CNPJ") || null;
+                    nomeEmitente = xmlTag(xmlContent, "xNome") || null;
+                    numero = null;
+                    serie = null;
+                    dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+                    valorTotal = parseFloat(xmlTag(xmlContent, "vNF")) || null;
+                    tipoDoc = "resumo";
+                  } else {
+                    cnpjEmitente = xmlTag(xmlContent, "CNPJ") || null;
+                    nomeEmitente = xmlTag(xmlContent, "xNome") || null;
+                    numero = xmlTag(xmlContent, "nNF") || null;
+                    serie = xmlTag(xmlContent, "serie") || null;
+                    dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+                    valorTotal = parseFloat(xmlTag(xmlContent, "vNF")) || null;
+                    tipoDoc = "outro";
+                  }
+
+                  const { data: insertedNF, error: insertErr } = await supabase.from("notas_fiscais").insert({
+                    empresa_id: empresa.id,
+                    chave_acesso: chNFe,
+                    numero_nf: numero,
+                    serie,
+                    data_emissao: dataEmissao,
+                    valor_total_nf: valorTotal,
+                    emit_cnpj: cnpjEmitente,
+                    emit_razao_social: nomeEmitente,
+                    status_sefaz: "recebida",
+                    nsu: nsuVal,
+                    tipo_documento: tipoDoc,
+                    xml_completo: xmlContent.slice(0, 50000),
+                    origem: "sefaz",
+                  }).select("id").single();
+
+                  if (!insertErr && insertedNF) {
+                    notasNovas++;
+                    // Auto-gerar contas a pagar
+                    if (isNFeProc) {
+                      try {
+                        const parcelas = extrairParcelas(xmlContent);
+                        if (parcelas.length > 0) {
+                          const contasInsert = parcelas.map((p) => ({
+                            empresa_id: empresa.id,
+                            tipo: "pagar",
+                            status: "previsto",
+                            origem: "sefaz",
+                            descricao: `NF-e ${numero || ""} - ${nomeEmitente || ""} (${p.nDup}/${parcelas.length})`.trim(),
+                            valor_original: p.valor,
+                            data_vencimento: p.vencimento,
+                            data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
+                            nota_fiscal_id: insertedNF.id,
+                            parcela_numero: parseInt(p.nDup) || p.index,
+                            parcela_total: parcelas.length,
+                            documento_ref: chNFe,
+                          }));
+                          await supabase.from("contas").insert(contasInsert);
+                          console.log(`[cron] NF ${numero}: ${parcelas.length} conta(s) criada(s)`);
+                        } else {
+                          await supabase.from("contas").insert({
+                            empresa_id: empresa.id,
+                            tipo: "pagar",
+                            status: "previsto",
+                            origem: "sefaz",
+                            descricao: `NF-e ${numero || ""} - ${nomeEmitente || ""}`.trim(),
+                            valor_original: valorTotal || 0,
+                            data_vencimento: dataEmissao ? dataEmissao.split("T")[0] : new Date().toISOString().split("T")[0],
+                            data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
+                            nota_fiscal_id: insertedNF.id,
+                            parcela_numero: 1,
+                            parcela_total: 1,
+                            documento_ref: chNFe,
+                          });
+                        }
+                      } catch (e) { console.error(`[cron] Erro parcelas: ${e.message}`); }
+                    }
+                  }
+                }
+              } catch (docErr) {
+                console.error(`[cron] Erro doc: ${docErr.message}`);
+              }
+            }
+
+            await supabase.from("empresas").update({ sefaz_ultimo_nsu: ultNSU }).eq("id", empresa.id);
+            if (cStat === "137" || ultNSU >= maxNSU) break;
+
+          } else if (cStat === "656") {
+            console.log(`[cron] Empresa ${empresa.cnpj}: consumo indevido, pulando`);
+            break;
+          } else {
+            console.log(`[cron] Empresa ${empresa.cnpj}: SEFAZ ${cStat}`);
+            break;
+          }
+
+          // Aguardar 2s entre loops pra não estourar rate limit
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        await salvarSyncLog(supabase, empresa.id, notasNovas > 0 ? "sucesso" : "sucesso", totalDocs, notasNovas, nsuInicio, ultNSU, `Cron auto-sync: ${notasNovas} notas novas`);
+        console.log(`[cron] Empresa ${empresa.cnpj}: ${totalDocs} docs, ${notasNovas} novas`);
+
+        // Aguardar 5s entre empresas pra não sobrecarregar
+        await new Promise(r => setTimeout(r, 5000));
+
+      } catch (empresaErr) {
+        console.error(`[cron] Erro empresa ${empresa.cnpj}: ${empresaErr.message}`);
+      }
+    }
+
+    console.log(`[cron] Sync automático concluído: ${new Date().toISOString()}`);
+  } catch (e) {
+    console.error(`[cron] Erro geral: ${e.message}`);
+  }
+}
+
+// Agendar sync automático: todo dia às 02:00 (horário de Brasília = 05:00 UTC)
+cron.schedule("0 5 * * *", () => {
+  console.log("[cron] Disparando sync automático 02:00 BRT...");
+  autoSyncTodasEmpresas();
+}, { timezone: "America/Sao_Paulo" });
+
+// ══════════════════════════════════════════════════════
 // START
 // ══════════════════════════════════════════════════════
 app.listen(PORT, () => {
   console.log(`🛰️  Sentinel SEFAZ Proxy rodando na porta ${PORT}`);
   console.log(`   Ambiente: ${process.env.SEFAZ_AMBIENTE || "producao"}`);
+  console.log(`   Auto-sync: todo dia às 02:00 BRT`);
 });
