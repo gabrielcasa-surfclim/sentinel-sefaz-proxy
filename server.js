@@ -449,6 +449,20 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
           if (!b64) continue;
 
           const xmlContent = decompressGzip(b64);
+          const schema = schemaMatch ? schemaMatch[1] : null;
+          const nsuVal = nsuMatch ? nsuMatch[1] : null;
+
+          // Identificar tipo de documento
+          const isResEvento = schema?.includes("resEvento") || xmlContent.includes("<resEvento");
+          const isResNFe = schema?.includes("resNFe") || xmlContent.includes("<resNFe");
+          const isNFeProc = schema?.includes("procNFe") || xmlContent.includes("<nfeProc");
+
+          // Ignorar eventos (resEvento) — não são notas fiscais
+          if (isResEvento) {
+            console.log(`[sync] NSU ${nsuVal}: resEvento ignorado (${xmlTag(xmlContent, "tpEvento")} - ${xmlTag(xmlContent, "xEvento")})`);
+            continue;
+          }
+
           const chNFe = xmlTag(xmlContent, "chNFe");
           if (!chNFe) continue;
 
@@ -457,22 +471,53 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
             .eq("empresa_id", empresa_id).eq("chave_acesso", chNFe).maybeSingle();
 
           if (!existing?.data) {
-            const nsuVal = nsuMatch ? nsuMatch[1] : null;
-            const schema = schemaMatch ? schemaMatch[1] : null;
-            const isResumo = schema && schema.includes("resNFe");
+            // Extrair dados conforme tipo de documento
+            let numero, serie, dataEmissao, valorTotal, cnpjEmitente, nomeEmitente, tipoDoc;
+
+            if (isNFeProc) {
+              // NF-e completa — extrair do bloco <emit> pra pegar CNPJ/nome do emitente
+              const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
+              cnpjEmitente = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
+              nomeEmitente = xmlTag(emitBlock, "xNome") || null;
+              numero = xmlTag(xmlContent, "nNF") || null;
+              serie = xmlTag(xmlContent, "serie") || null;
+              dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+              // Pegar vNF do bloco ICMSTot (valor total da nota)
+              const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
+              valorTotal = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
+              tipoDoc = "completo";
+            } else if (isResNFe) {
+              // Resumo de NF-e — campos diretos
+              cnpjEmitente = xmlTag(xmlContent, "CNPJ") || null;
+              nomeEmitente = xmlTag(xmlContent, "xNome") || null;
+              numero = null; // resumo não tem número
+              serie = null;
+              dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+              valorTotal = parseFloat(xmlTag(xmlContent, "vNF")) || null;
+              tipoDoc = "resumo";
+            } else {
+              // Outro tipo — tentar extração genérica
+              cnpjEmitente = xmlTag(xmlContent, "CNPJ") || null;
+              nomeEmitente = xmlTag(xmlContent, "xNome") || null;
+              numero = xmlTag(xmlContent, "nNF") || null;
+              serie = xmlTag(xmlContent, "serie") || null;
+              dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+              valorTotal = parseFloat(xmlTag(xmlContent, "vNF")) || null;
+              tipoDoc = "outro";
+            }
 
             const { error: insertErr } = await supabase.from("notas_fiscais").insert({
               empresa_id,
               chave_acesso: chNFe,
-              numero: xmlTag(xmlContent, "nNF") || null,
-              serie: xmlTag(xmlContent, "serie") || null,
-              data_emissao: xmlTag(xmlContent, "dhEmi") || null,
-              valor_total: parseFloat(xmlTag(xmlContent, "vNF")) || null,
-              cnpj_emitente: xmlTag(xmlContent, "CNPJ") || null,
-              nome_emitente: xmlTag(xmlContent, "xNome") || null,
+              numero,
+              serie,
+              data_emissao: dataEmissao,
+              valor_total: valorTotal,
+              cnpj_emitente: cnpjEmitente,
+              nome_emitente: nomeEmitente,
               status_sefaz: "recebida",
               nsu: nsuVal,
-              tipo_documento: isResumo ? "resumo" : "completo",
+              tipo_documento: tipoDoc,
               xml_completo: xmlContent.slice(0, 50000),
             });
             if (!insertErr) notasNovas++;
