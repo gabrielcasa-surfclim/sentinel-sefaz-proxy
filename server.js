@@ -822,7 +822,7 @@ async function autoSyncTodasEmpresas() {
         }
 
         const cnpj = (empresa.cnpj || "").replace(/\D/g, "");
-        const ufCode = UF_CODES[empresa.uf] || "42";
+        const ufCode = UF_CODE[empresa.uf] || "42";
         const tpAmb = "1"; // Sempre produção no cron
         const sefazUrl = SEFAZ_URLS.dist_dfe.producao;
 
