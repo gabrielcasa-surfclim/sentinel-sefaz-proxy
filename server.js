@@ -934,6 +934,42 @@ async function autoSyncTodasEmpresas() {
 
                   if (!insertErr && insertedNF) {
                     notasNovas++;
+
+                    // ═══ AUTO-MANIFESTAR CIÊNCIA DA OPERAÇÃO (apenas resumos) ═══
+                    // Quando a SEFAZ entrega apenas o resumo (resNFe), precisamos
+                    // manifestar "Ciência da Operação" (210210) para que na próxima
+                    // sync a SEFAZ entregue o XML completo (procNFe).
+                    // IMPORTANTE: Apenas Ciência — nunca Confirmação/Desconhecimento.
+                    if (isResNFe && chNFe) {
+                      try {
+                        const manifestSoap = buildManifestacaoSoap(
+                          chNFe, cnpj, tpAmb,
+                          "210210",              // Ciência da Operação
+                          "Ciencia da Operacao",
+                          undefined,             // sem justificativa
+                          cert.cert_pem, cert.key_pem
+                        );
+                        const manifestUrl = SEFAZ_URLS.recepcao_evento.producao;
+                        const soapAction = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento";
+                        const manifestResp = await sefazRequest(manifestUrl, manifestSoap, cert.cert_pem, cert.key_pem, 30000, soapAction);
+                        const manifestEvento = parseRetEvento(manifestResp.body);
+                        const manifestOk = manifestEvento.cStat === "135" || manifestEvento.cStat === "136" || manifestEvento.cStat === "573";
+                        // 573 = já manifestada anteriormente (ok, segue)
+                        if (manifestOk) {
+                          await supabase.from("notas_fiscais").update({
+                            status_manifestacao: "ciencia"
+                          }).eq("id", insertedNF.id);
+                          console.log(`[cron] NF ${chNFe.slice(-10)}: Ciência da Operação registrada (${manifestEvento.cStat})`);
+                        } else {
+                          console.warn(`[cron] NF ${chNFe.slice(-10)}: Ciência falhou: ${manifestEvento.cStat} - ${manifestEvento.xMotivo}`);
+                        }
+                        // Aguardar 1s entre manifestações pra não estourar rate limit
+                        await new Promise(r => setTimeout(r, 1000));
+                      } catch (manifestErr) {
+                        console.error(`[cron] Erro manifestação NF ${chNFe.slice(-10)}: ${manifestErr.message}`);
+                      }
+                    }
+
                     // Auto-gerar contas a pagar
                     if (isNFeProc) {
                       try {
@@ -997,6 +1033,49 @@ async function autoSyncTodasEmpresas() {
 
         await salvarSyncLog(supabase, empresa.id, notasNovas > 0 ? "sucesso" : "sucesso", totalDocs, notasNovas, nsuInicio, ultNSU, `Cron auto-sync: ${notasNovas} notas novas`);
         console.log(`[cron] Empresa ${empresa.cnpj}: ${totalDocs} docs, ${notasNovas} novas`);
+
+        // ═══ MANIFESTAR NOTAS RESUMO PENDENTES ═══
+        // Buscar notas que são resumo e ainda não tiveram Ciência manifestada
+        // Isso cobre notas que foram importadas antes dessa funcionalidade existir
+        try {
+          const { data: resumosPendentes } = await supabase
+            .from("notas_fiscais")
+            .select("id, chave_acesso")
+            .eq("empresa_id", empresa.id)
+            .eq("tipo_documento", "resumo")
+            .or("status_manifestacao.is.null,status_manifestacao.eq.pendente")
+            .limit(20); // Processar no máximo 20 por ciclo
+
+          if (resumosPendentes && resumosPendentes.length > 0) {
+            console.log(`[cron] ${empresa.cnpj}: ${resumosPendentes.length} resumos pendentes de ciência`);
+            for (const nfResumo of resumosPendentes) {
+              if (!nfResumo.chave_acesso) continue;
+              try {
+                const manifestSoap = buildManifestacaoSoap(
+                  nfResumo.chave_acesso, cnpj, tpAmb,
+                  "210210", "Ciencia da Operacao",
+                  undefined, cert.cert_pem, cert.key_pem
+                );
+                const manifestUrl = SEFAZ_URLS.recepcao_evento.producao;
+                const soapAction = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento";
+                const manifestResp = await sefazRequest(manifestUrl, manifestSoap, cert.cert_pem, cert.key_pem, 30000, soapAction);
+                const manifestEvento = parseRetEvento(manifestResp.body);
+                const manifestOk = manifestEvento.cStat === "135" || manifestEvento.cStat === "136" || manifestEvento.cStat === "573";
+                if (manifestOk) {
+                  await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" }).eq("id", nfResumo.id);
+                  console.log(`[cron] NF pendente ${nfResumo.chave_acesso.slice(-10)}: Ciência registrada (${manifestEvento.cStat})`);
+                } else {
+                  console.warn(`[cron] NF pendente ${nfResumo.chave_acesso.slice(-10)}: falhou ${manifestEvento.cStat}`);
+                }
+                await new Promise(r => setTimeout(r, 1000));
+              } catch (e) {
+                console.error(`[cron] Erro ciência pendente: ${e.message}`);
+              }
+            }
+          }
+        } catch (e) {
+          console.error(`[cron] Erro buscar resumos pendentes: ${e.message}`);
+        }
 
         // Aguardar 5s entre empresas pra não sobrecarregar
         await new Promise(r => setTimeout(r, 5000));
