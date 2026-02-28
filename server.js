@@ -934,42 +934,6 @@ async function autoSyncTodasEmpresas() {
 
                   if (!insertErr && insertedNF) {
                     notasNovas++;
-
-                    // ═══ AUTO-MANIFESTAR CIÊNCIA DA OPERAÇÃO (apenas resumos) ═══
-                    // Quando a SEFAZ entrega apenas o resumo (resNFe), precisamos
-                    // manifestar "Ciência da Operação" (210210) para que na próxima
-                    // sync a SEFAZ entregue o XML completo (procNFe).
-                    // IMPORTANTE: Apenas Ciência — nunca Confirmação/Desconhecimento.
-                    if (isResNFe && chNFe) {
-                      try {
-                        const manifestSoap = buildManifestacaoSoap(
-                          chNFe, cnpj, tpAmb,
-                          "210210",              // Ciência da Operação
-                          "Ciencia da Operacao",
-                          undefined,             // sem justificativa
-                          cert.cert_pem, cert.key_pem
-                        );
-                        const manifestUrl = SEFAZ_URLS.recepcao_evento.producao;
-                        const soapAction = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento";
-                        const manifestResp = await sefazRequest(manifestUrl, manifestSoap, cert.cert_pem, cert.key_pem, 30000, soapAction);
-                        const manifestEvento = parseRetEvento(manifestResp.body);
-                        const manifestOk = manifestEvento.cStat === "135" || manifestEvento.cStat === "136" || manifestEvento.cStat === "573";
-                        // 573 = já manifestada anteriormente (ok, segue)
-                        if (manifestOk) {
-                          await supabase.from("notas_fiscais").update({
-                            status_manifestacao: "ciencia"
-                          }).eq("id", insertedNF.id);
-                          console.log(`[cron] NF ${chNFe.slice(-10)}: Ciência da Operação registrada (${manifestEvento.cStat})`);
-                        } else {
-                          console.warn(`[cron] NF ${chNFe.slice(-10)}: Ciência falhou: ${manifestEvento.cStat} - ${manifestEvento.xMotivo}`);
-                        }
-                        // Aguardar 1s entre manifestações pra não estourar rate limit
-                        await new Promise(r => setTimeout(r, 1000));
-                      } catch (manifestErr) {
-                        console.error(`[cron] Erro manifestação NF ${chNFe.slice(-10)}: ${manifestErr.message}`);
-                      }
-                    }
-
                     // Auto-gerar contas a pagar
                     if (isNFeProc) {
                       try {
@@ -1034,47 +998,154 @@ async function autoSyncTodasEmpresas() {
         await salvarSyncLog(supabase, empresa.id, notasNovas > 0 ? "sucesso" : "sucesso", totalDocs, notasNovas, nsuInicio, ultNSU, `Cron auto-sync: ${notasNovas} notas novas`);
         console.log(`[cron] Empresa ${empresa.cnpj}: ${totalDocs} docs, ${notasNovas} novas`);
 
-        // ═══ MANIFESTAR NOTAS RESUMO PENDENTES ═══
-        // Buscar notas que são resumo e ainda não tiveram Ciência manifestada
-        // Isso cobre notas que foram importadas antes dessa funcionalidade existir
+        // ══════════════════════════════════════════════════════
+        // AUTO-MANIFESTAÇÃO: Ciência da Operação para NFs do tipo "resumo"
+        // Sem manifestar, a SEFAZ não libera o XML completo (nfeProc)
+        // ══════════════════════════════════════════════════════
         try {
-          const { data: resumosPendentes } = await supabase
+          const { data: nfsSemManifesto } = await supabase
             .from("notas_fiscais")
             .select("id, chave_acesso")
             .eq("empresa_id", empresa.id)
-            .eq("tipo_documento", "resumo")
-            .or("status_manifestacao.is.null,status_manifestacao.eq.pendente")
-            .limit(20); // Processar no máximo 20 por ciclo
+            .is("status_manifestacao", null)
+            .not("chave_acesso", "is", null)
+            .limit(5); // Máximo 5 por ciclo pra não estourar rate limit
 
-          if (resumosPendentes && resumosPendentes.length > 0) {
-            console.log(`[cron] ${empresa.cnpj}: ${resumosPendentes.length} resumos pendentes de ciência`);
-            for (const nfResumo of resumosPendentes) {
-              if (!nfResumo.chave_acesso) continue;
+          if (nfsSemManifesto && nfsSemManifesto.length > 0) {
+            console.log(`[cron] ${empresa.cnpj}: ${nfsSemManifesto.length} NF(s) sem manifestação, manifestando...`);
+            const sefazUrlEvento = SEFAZ_URLS.recepcao_evento.producao;
+            const soapAction = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento";
+
+            for (const nf of nfsSemManifesto) {
               try {
-                const manifestSoap = buildManifestacaoSoap(
-                  nfResumo.chave_acesso, cnpj, tpAmb,
-                  "210210", "Ciencia da Operacao",
+                const soap = buildManifestacaoSoap(
+                  nf.chave_acesso, cnpj, tpAmb,
+                  MANIFESTACAO.ciencia.codigo, MANIFESTACAO.ciencia.descricao,
                   undefined, cert.cert_pem, cert.key_pem
                 );
-                const manifestUrl = SEFAZ_URLS.recepcao_evento.producao;
-                const soapAction = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento";
-                const manifestResp = await sefazRequest(manifestUrl, manifestSoap, cert.cert_pem, cert.key_pem, 30000, soapAction);
-                const manifestEvento = parseRetEvento(manifestResp.body);
-                const manifestOk = manifestEvento.cStat === "135" || manifestEvento.cStat === "136" || manifestEvento.cStat === "573";
-                if (manifestOk) {
-                  await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" }).eq("id", nfResumo.id);
-                  console.log(`[cron] NF pendente ${nfResumo.chave_acesso.slice(-10)}: Ciência registrada (${manifestEvento.cStat})`);
+
+                const resp = await sefazRequest(sefazUrlEvento, soap, cert.cert_pem, cert.key_pem, 30000, soapAction);
+                const evento = parseRetEvento(resp.body);
+                const sucesso = evento.cStat === "135" || evento.cStat === "136";
+
+                if (sucesso) {
+                  await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" }).eq("id", nf.id);
+                  console.log(`[cron] Manifestação OK: ${nf.chave_acesso.slice(-10)} → ciência`);
+                } else if (evento.cStat === "573") {
+                  // Já manifestada anteriormente
+                  await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" }).eq("id", nf.id);
+                  console.log(`[cron] Manifestação já existia: ${nf.chave_acesso.slice(-10)}`);
                 } else {
-                  console.warn(`[cron] NF pendente ${nfResumo.chave_acesso.slice(-10)}: falhou ${manifestEvento.cStat}`);
+                  console.log(`[cron] Manifestação falhou: ${nf.chave_acesso.slice(-10)} → ${evento.cStat}: ${evento.xMotivo}`);
                 }
-                await new Promise(r => setTimeout(r, 1000));
-              } catch (e) {
-                console.error(`[cron] Erro ciência pendente: ${e.message}`);
+
+                // Delay de 3s entre manifestações
+                await new Promise(r => setTimeout(r, 3000));
+              } catch (manifErr) {
+                console.error(`[cron] Erro manifestação ${nf.chave_acesso.slice(-10)}: ${manifErr.message}`);
               }
             }
+
+            // Após manifestar, aguardar 10s e fazer um novo DistDFe pra buscar XMLs completos
+            console.log(`[cron] ${empresa.cnpj}: aguardando 10s para buscar XMLs completos...`);
+            await new Promise(r => setTimeout(r, 10000));
+
+            // Re-sync pra pegar os XMLs completos (nfeProc) que a SEFAZ libera após manifestação
+            try {
+              const soapRetry = buildDistDFeSoap(cnpj, ufCode, tpAmb, nsuInicio);
+              const respRetry = await sefazRequest(sefazUrl, soapRetry, cert.cert_pem, cert.key_pem);
+              const cStatRetry = xmlTag(respRetry.body, "cStat");
+
+              if (cStatRetry === "137" || cStatRetry === "138") {
+                const docMatchesRetry = respRetry.body.match(/<docZip[\s\S]*?<\/docZip>/gi) || [];
+                let xmlsAtualizados = 0;
+
+                for (const docZip of docMatchesRetry) {
+                  try {
+                    const b64 = docZip.replace(/<\/?docZip[^>]*>/gi, "").trim();
+                    if (!b64) continue;
+                    const xmlContent = decompressGzip(b64);
+
+                    const isNFeProc = xmlContent.includes("<nfeProc") || xmlContent.includes("<procNFe");
+                    if (!isNFeProc) continue;
+
+                    const chNFe = xmlTag(xmlContent, "chNFe");
+                    if (!chNFe) continue;
+
+                    // Atualizar a NF existente com XML completo
+                    const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
+                    const numero = xmlTag(xmlContent, "nNF") || null;
+                    const serie = xmlTag(xmlContent, "serie") || null;
+                    const dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+                    const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
+                    const valorTotal = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
+                    const cnpjEmitente = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
+                    const nomeEmitente = xmlTag(emitBlock, "xNome") || null;
+
+                    const { error: updErr } = await supabase.from("notas_fiscais").update({
+                      tipo_documento: "completo",
+                      xml_completo: xmlContent.slice(0, 50000),
+                      numero_nf: numero,
+                      serie,
+                      data_emissao: dataEmissao,
+                      valor_total_nf: valorTotal,
+                      emit_cnpj: cnpjEmitente,
+                      emit_razao_social: nomeEmitente,
+                    }).eq("empresa_id", empresa.id).eq("chave_acesso", chNFe);
+
+                    if (!updErr) {
+                      xmlsAtualizados++;
+
+                      // Auto-gerar contas a pagar se ainda não existem
+                      const { data: existingNF } = await supabase
+                        .from("notas_fiscais").select("id")
+                        .eq("empresa_id", empresa.id).eq("chave_acesso", chNFe).single();
+
+                      if (existingNF && numero) {
+                        const { data: contasExist } = await supabase
+                          .from("contas").select("id")
+                          .eq("nota_fiscal_id", existingNF.id).limit(1);
+
+                        if (!contasExist || contasExist.length === 0) {
+                          try {
+                            const parcelas = extrairParcelas(xmlContent);
+                            if (parcelas.length > 0) {
+                              const contasInsert = parcelas.map((p) => ({
+                                empresa_id: empresa.id,
+                                tipo: "pagar",
+                                status: "previsto",
+                                origem: "sefaz",
+                                descricao: `NF-e ${numero} - ${nomeEmitente || ""} (${p.nDup}/${parcelas.length})`.trim(),
+                                valor_original: p.valor,
+                                data_vencimento: p.vencimento,
+                                data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
+                                nota_fiscal_id: existingNF.id,
+                                parcela_numero: parseInt(p.nDup) || 1,
+                                parcela_total: parcelas.length,
+                                documento_ref: chNFe,
+                              }));
+                              await supabase.from("contas").insert(contasInsert);
+                              console.log(`[cron] NF ${numero}: ${parcelas.length} conta(s) criada(s) após manifestação`);
+                            }
+                          } catch (e) { console.error(`[cron] Erro parcelas pós-manifesto: ${e.message}`); }
+                        }
+                      }
+                    }
+                  } catch (docErr) {
+                    console.error(`[cron] Erro doc retry: ${docErr.message}`);
+                  }
+                }
+
+                if (xmlsAtualizados > 0) {
+                  console.log(`[cron] ${empresa.cnpj}: ${xmlsAtualizados} XML(s) completo(s) obtidos após manifestação`);
+                }
+              }
+            } catch (retryErr) {
+              console.error(`[cron] Erro re-sync: ${retryErr.message}`);
+            }
           }
-        } catch (e) {
-          console.error(`[cron] Erro buscar resumos pendentes: ${e.message}`);
+        } catch (manifGlobalErr) {
+          console.error(`[cron] Erro geral manifestação ${empresa.cnpj}: ${manifGlobalErr.message}`);
         }
 
         // Aguardar 5s entre empresas pra não sobrecarregar
