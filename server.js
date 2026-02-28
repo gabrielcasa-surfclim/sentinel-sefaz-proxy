@@ -621,7 +621,110 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
   const status = errors.length > 0 ? "parcial" : "sucesso";
   await salvarSyncLog(supabase, empresa_id, status, totalDocs, notasNovas, nsuInicio, ultNSU, nenhum ? "Nenhum documento novo" : `${notasNovas} nota(s) nova(s) importada(s)`);
 
-  return res.json({ success: true, data: { notas_encontradas: totalDocs, notas_novas: notasNovas, ultimo_nsu: ultNSU, max_nsu: maxNSU, loops, errors, nenhum_documento: nenhum, parcial: errors.length > 0, consumo_indevido: false } });
+  // ══════════════════════════════════════════════════════
+  // AUTO-MANIFESTAÇÃO no sync manual (mesma lógica do cron)
+  // ══════════════════════════════════════════════════════
+  let manifestadas = 0;
+  let xmlsCompletos = 0;
+  try {
+    const { data: nfsSemManifesto } = await supabase
+      .from("notas_fiscais")
+      .select("id, chave_acesso")
+      .eq("empresa_id", empresa_id)
+      .is("status_manifestacao", null)
+      .not("chave_acesso", "is", null)
+      .limit(5);
+
+    if (nfsSemManifesto && nfsSemManifesto.length > 0) {
+      console.log(`[sync] ${nfsSemManifesto.length} NF(s) sem manifestação, manifestando...`);
+      const sefazUrlEvento = SEFAZ_URLS.recepcao_evento[ambiente] || SEFAZ_URLS.recepcao_evento.producao;
+      const soapAction = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento";
+
+      for (const nf of nfsSemManifesto) {
+        try {
+          const soapManif = buildManifestacaoSoap(
+            nf.chave_acesso, cnpj, tpAmb,
+            MANIFESTACAO.ciencia.codigo, MANIFESTACAO.ciencia.descricao,
+            undefined, cert.cert_pem, cert.key_pem
+          );
+          const respManif = await sefazRequest(sefazUrlEvento, soapManif, cert.cert_pem, cert.key_pem, 30000, soapAction);
+          const evento = parseRetEvento(respManif.body);
+          const sucManif = evento.cStat === "135" || evento.cStat === "136" || evento.cStat === "573";
+
+          if (sucManif) {
+            await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" }).eq("id", nf.id);
+            manifestadas++;
+            console.log(`[sync] Manifestação OK: ${nf.chave_acesso.slice(-10)}`);
+          } else {
+            console.log(`[sync] Manifestação falhou: ${nf.chave_acesso.slice(-10)} → ${evento.cStat}: ${evento.xMotivo}`);
+          }
+          await new Promise(r => setTimeout(r, 3000));
+        } catch (manifErr) {
+          console.error(`[sync] Erro manifestação ${nf.chave_acesso.slice(-10)}: ${manifErr.message}`);
+        }
+      }
+
+      // Re-sync pra pegar XMLs completos
+      if (manifestadas > 0) {
+        console.log(`[sync] Aguardando 10s para buscar XMLs completos...`);
+        await new Promise(r => setTimeout(r, 10000));
+
+        try {
+          const soapRetry = buildDistDFeSoap(cnpj, ufCode, tpAmb, nsuInicio);
+          const respRetry = await sefazRequest(sefazUrl, soapRetry, cert.cert_pem, cert.key_pem);
+          const cStatRetry = xmlTag(respRetry.body, "cStat");
+
+          if (cStatRetry === "137" || cStatRetry === "138") {
+            const docMatchesRetry = respRetry.body.match(/<docZip[\s\S]*?<\/docZip>/gi) || [];
+
+            for (const docZip of docMatchesRetry) {
+              try {
+                const b64 = docZip.replace(/<\/?docZip[^>]*>/gi, "").trim();
+                if (!b64) continue;
+                const xmlContent = decompressGzip(b64);
+
+                const isNFeProc = xmlContent.includes("<nfeProc") || xmlContent.includes("<procNFe");
+                if (!isNFeProc) continue;
+
+                const chNFe = xmlTag(xmlContent, "chNFe");
+                if (!chNFe) continue;
+
+                const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
+                const numero = xmlTag(xmlContent, "nNF") || null;
+                const serie = xmlTag(xmlContent, "serie") || null;
+                const dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
+                const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
+                const valorTotal = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
+                const cnpjEmitente = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
+                const nomeEmitente = xmlTag(emitBlock, "xNome") || null;
+
+                const { error: updErr } = await supabase.from("notas_fiscais").update({
+                  tipo_documento: "completo",
+                  xml_completo: xmlContent.slice(0, 50000),
+                  numero_nf: numero,
+                  serie,
+                  data_emissao: dataEmissao,
+                  valor_total_nf: valorTotal,
+                  emit_cnpj: cnpjEmitente,
+                  emit_razao_social: nomeEmitente,
+                }).eq("empresa_id", empresa_id).eq("chave_acesso", chNFe);
+
+                if (!updErr) xmlsCompletos++;
+              } catch (docErr) {
+                console.error(`[sync] Erro doc retry: ${docErr.message}`);
+              }
+            }
+          }
+        } catch (retryErr) {
+          console.error(`[sync] Erro re-sync: ${retryErr.message}`);
+        }
+      }
+    }
+  } catch (manifGlobalErr) {
+    console.error(`[sync] Erro geral manifestação: ${manifGlobalErr.message}`);
+  }
+
+  return res.json({ success: true, data: { notas_encontradas: totalDocs, notas_novas: notasNovas, ultimo_nsu: ultNSU, max_nsu: maxNSU, loops, errors, nenhum_documento: nenhum, parcial: errors.length > 0, consumo_indevido: false, manifestadas, xmls_completos: xmlsCompletos } });
 });
 
 // ══════════════════════════════════════════════════════
