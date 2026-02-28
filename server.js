@@ -472,12 +472,23 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
 
           // Identificar tipo de documento
           const isResEvento = schema?.includes("resEvento") || xmlContent.includes("<resEvento");
+          const isProcEvento = schema?.includes("procEventoNFe") || xmlContent.includes("<procEventoNFe");
           const isResNFe = schema?.includes("resNFe") || xmlContent.includes("<resNFe");
           const isNFeProc = schema?.includes("procNFe") || xmlContent.includes("<nfeProc");
 
-          // Ignorar eventos (resEvento) — não são notas fiscais
+          // Ignorar eventos (resEvento e procEventoNFe) — não são notas fiscais
           if (isResEvento) {
             console.log(`[sync] NSU ${nsuVal}: resEvento ignorado (${xmlTag(xmlContent, "tpEvento")} - ${xmlTag(xmlContent, "xEvento")})`);
+            continue;
+          }
+          if (isProcEvento) {
+            console.log(`[sync] NSU ${nsuVal}: procEventoNFe ignorado (recibo de manifestação)`);
+            // Se já existe a NF com essa chave, atualizar status_manifestacao
+            const chNFeEvt = xmlTag(xmlContent, "chNFe");
+            if (chNFeEvt) {
+              await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" })
+                .eq("empresa_id", empresa_id).eq("chave_acesso", chNFeEvt);
+            }
             continue;
           }
 
@@ -485,10 +496,67 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
           if (!chNFe) continue;
 
           const existing = await supabase
-            .from("notas_fiscais").select("id")
+            .from("notas_fiscais").select("id, tipo_documento")
             .eq("empresa_id", empresa_id).eq("chave_acesso", chNFe).maybeSingle();
 
-          if (!existing?.data) {
+          // Se já existe como "completo", pular. Se existe como "resumo"/"outro" e novo é nfeProc, atualizar.
+          if (existing?.data && isNFeProc && existing.data.tipo_documento !== "completo") {
+            // Upgrade: resumo → completo
+            const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
+            const upCnpj = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
+            const upNome = xmlTag(emitBlock, "xNome") || null;
+            const upNumero = xmlTag(xmlContent, "nNF") || null;
+            const upSerie = xmlTag(xmlContent, "serie") || null;
+            const upData = xmlTag(xmlContent, "dhEmi") || null;
+            const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
+            const upValor = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
+
+            await supabase.from("notas_fiscais").update({
+              tipo_documento: "completo",
+              xml_completo: xmlContent.slice(0, 50000),
+              numero_nf: upNumero,
+              serie: upSerie,
+              data_emissao: upData,
+              valor_total_nf: upValor,
+              emit_cnpj: upCnpj,
+              emit_razao_social: upNome,
+            }).eq("id", existing.data.id);
+
+            console.log(`[sync] NF ${upNumero || chNFe.slice(-10)}: atualizada resumo → completo`);
+
+            // Criar contas a pagar se não existem
+            const { data: contasExist } = await supabase
+              .from("contas").select("id").eq("nota_fiscal_id", existing.data.id).limit(1);
+            if (!contasExist || contasExist.length === 0) {
+              try {
+                const parcelas = extrairParcelas(xmlContent);
+                if (parcelas.length > 0) {
+                  const contasInsert = parcelas.map((p) => ({
+                    empresa_id,
+                    tipo: "pagar",
+                    status: "previsto",
+                    origem: "sefaz",
+                    descricao: `NF-e ${upNumero || ""} - ${upNome || ""} (${p.nDup}/${parcelas.length})`.trim(),
+                    valor_original: p.valor,
+                    data_vencimento: p.vencimento,
+                    data_emissao: upData ? upData.split("T")[0] : null,
+                    nota_fiscal_id: existing.data.id,
+                    parcela_numero: parseInt(p.nDup) || p.index,
+                    parcela_total: parcelas.length,
+                    documento_ref: chNFe,
+                  }));
+                  await supabase.from("contas").insert(contasInsert);
+                  console.log(`[sync] NF ${upNumero}: ${parcelas.length} conta(s) criada(s) após upgrade`);
+                }
+              } catch (e) { console.error(`[sync] Erro parcelas upgrade: ${e.message}`); }
+            }
+            notasNovas++;
+            continue;
+          }
+
+          if (existing?.data) continue; // Já existe e não precisa atualizar
+
+          if (true) {
             // Extrair dados conforme tipo de documento
             let numero, serie, dataEmissao, valorTotal, cnpjEmitente, nomeEmitente, tipoDoc;
 
@@ -508,8 +576,15 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
               // Resumo de NF-e — campos diretos
               cnpjEmitente = xmlTag(xmlContent, "CNPJ") || null;
               nomeEmitente = xmlTag(xmlContent, "xNome") || null;
-              numero = null; // resumo não tem número
-              serie = null;
+              // resNFe não tem nNF, mas podemos extrair da chave de acesso
+              // Chave: UF(2) AAMM(4) CNPJ(14) mod(2) serie(3) numero(9) tpEmis(1) cNF(8) DV(1)
+              if (chNFe && chNFe.length === 44) {
+                serie = String(parseInt(chNFe.substring(22, 25), 10)); // remove zeros à esquerda
+                numero = String(parseInt(chNFe.substring(25, 34), 10)); // remove zeros à esquerda
+              } else {
+                serie = null;
+                numero = null;
+              }
               dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
               valorTotal = parseFloat(xmlTag(xmlContent, "vNF")) || null;
               tipoDoc = "resumo";
@@ -979,6 +1054,17 @@ async function autoSyncTodasEmpresas() {
                 const isResEvento = schema?.includes("resEvento") || xmlContent.includes("<resEvento");
                 if (isResEvento) continue;
 
+                const isProcEvento = schema?.includes("procEventoNFe") || xmlContent.includes("<procEventoNFe");
+                if (isProcEvento) {
+                  console.log(`[cron] NSU ${nsuVal}: procEventoNFe ignorado`);
+                  const chNFeEvt = xmlTag(xmlContent, "chNFe");
+                  if (chNFeEvt) {
+                    await supabase.from("notas_fiscais").update({ status_manifestacao: "ciencia" })
+                      .eq("empresa_id", empresa.id).eq("chave_acesso", chNFeEvt);
+                  }
+                  continue;
+                }
+
                 const isResNFe = schema?.includes("resNFe") || xmlContent.includes("<resNFe");
                 const isNFeProc = schema?.includes("procNFe") || xmlContent.includes("<nfeProc");
 
@@ -986,10 +1072,66 @@ async function autoSyncTodasEmpresas() {
                 if (!chNFe) continue;
 
                 const existing = await supabase
-                  .from("notas_fiscais").select("id")
+                  .from("notas_fiscais").select("id, tipo_documento")
                   .eq("empresa_id", empresa.id).eq("chave_acesso", chNFe).maybeSingle();
 
-                if (!existing?.data) {
+                // Upgrade resumo → completo se nfeProc chegou
+                if (existing?.data && isNFeProc && existing.data.tipo_documento !== "completo") {
+                  const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
+                  const upCnpj = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
+                  const upNome = xmlTag(emitBlock, "xNome") || null;
+                  const upNumero = xmlTag(xmlContent, "nNF") || null;
+                  const upSerie = xmlTag(xmlContent, "serie") || null;
+                  const upData = xmlTag(xmlContent, "dhEmi") || null;
+                  const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
+                  const upValor = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
+
+                  await supabase.from("notas_fiscais").update({
+                    tipo_documento: "completo",
+                    xml_completo: xmlContent.slice(0, 50000),
+                    numero_nf: upNumero,
+                    serie: upSerie,
+                    data_emissao: upData,
+                    valor_total_nf: upValor,
+                    emit_cnpj: upCnpj,
+                    emit_razao_social: upNome,
+                  }).eq("id", existing.data.id);
+
+                  console.log(`[cron] NF ${upNumero || chNFe.slice(-10)}: atualizada resumo → completo`);
+                  notasNovas++;
+
+                  // Criar contas a pagar se não existem
+                  const { data: contasExist } = await supabase
+                    .from("contas").select("id").eq("nota_fiscal_id", existing.data.id).limit(1);
+                  if (!contasExist || contasExist.length === 0) {
+                    try {
+                      const parcelas = extrairParcelas(xmlContent);
+                      if (parcelas.length > 0) {
+                        const contasInsert = parcelas.map((p) => ({
+                          empresa_id: empresa.id,
+                          tipo: "pagar",
+                          status: "previsto",
+                          origem: "sefaz",
+                          descricao: `NF-e ${upNumero || ""} - ${upNome || ""} (${p.nDup}/${parcelas.length})`.trim(),
+                          valor_original: p.valor,
+                          data_vencimento: p.vencimento,
+                          data_emissao: upData ? upData.split("T")[0] : null,
+                          nota_fiscal_id: existing.data.id,
+                          parcela_numero: parseInt(p.nDup) || 1,
+                          parcela_total: parcelas.length,
+                          documento_ref: chNFe,
+                        }));
+                        await supabase.from("contas").insert(contasInsert);
+                        console.log(`[cron] NF ${upNumero}: ${parcelas.length} conta(s) criada(s) após upgrade`);
+                      }
+                    } catch (e) { console.error(`[cron] Erro parcelas upgrade: ${e.message}`); }
+                  }
+                  continue;
+                }
+
+                if (existing?.data) continue;
+
+                {
                   let numero, serie, dataEmissao, valorTotal, cnpjEmitente, nomeEmitente, tipoDoc;
 
                   if (isNFeProc) {
@@ -1005,8 +1147,14 @@ async function autoSyncTodasEmpresas() {
                   } else if (isResNFe) {
                     cnpjEmitente = xmlTag(xmlContent, "CNPJ") || null;
                     nomeEmitente = xmlTag(xmlContent, "xNome") || null;
-                    numero = null;
-                    serie = null;
+                    // resNFe não tem nNF, extrair da chave de acesso
+                    if (chNFe && chNFe.length === 44) {
+                      serie = String(parseInt(chNFe.substring(22, 25), 10));
+                      numero = String(parseInt(chNFe.substring(25, 34), 10));
+                    } else {
+                      serie = null;
+                      numero = null;
+                    }
                     dataEmissao = xmlTag(xmlContent, "dhEmi") || null;
                     valorTotal = parseFloat(xmlTag(xmlContent, "vNF")) || null;
                     tipoDoc = "resumo";
