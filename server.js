@@ -359,10 +359,37 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
   const cStat = xmlTag(respText, "cStat");
   const xMotivo = xmlTag(respText, "xMotivo");
   console.log(`[consulta-chave] cStat: ${cStat} | ${xMotivo}`);
-  const retMatch = respText.match(/<retDistDFeInt[\s\S]*?<\/retDistDFeInt>/i);
+
+  if (cStat !== "138") {
+    return res.json({
+      success: false,
+      data: { cStat, xMotivo, chave_acesso: chave, xml: null, is_complete: false, reason: xMotivo },
+    });
+  }
+
+  // ── Extrair e descomprimir o docZip ───────────────────────────────────────
+  const docZipMatch = respText.match(/<docZip[^>]*>([^<]+)<\/docZip>/i);
+  let xmlCompleto = null;
+  let isComplete = false;
+  let reason = "Nenhum docZip retornado pela SEFAZ";
+
+  if (docZipMatch) {
+    try {
+      xmlCompleto = decompressGzip(docZipMatch[1].trim());
+      isComplete = xmlCompleto.includes("<nfeProc") || xmlCompleto.includes("<procNFe");
+      if (!isComplete) {
+        reason = "SEFAZ retornou apenas o resumo (resNFe). Manifeste Ciência da Operação e aguarde alguns minutos.";
+      }
+      console.log(`[consulta-chave] XML descomprimido: ${xmlCompleto.length} chars | isComplete: ${isComplete}`);
+    } catch (e) {
+      console.error(`[consulta-chave] Erro ao descomprimir docZip: ${e.message}`);
+      reason = `Erro ao descomprimir XML: ${e.message}`;
+    }
+  }
+
   return res.json({
     success: cStat === "138",
-    data: { cStat, xMotivo, chave_acesso: chave, retXml: retMatch ? retMatch[0].slice(0, 2000) : null },
+    data: { cStat, xMotivo, chave_acesso: chave, xml: xmlCompleto, is_complete: isComplete, reason: isComplete ? null : reason },
   });
 });
 
