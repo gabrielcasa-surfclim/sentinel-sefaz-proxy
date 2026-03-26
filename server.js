@@ -58,10 +58,6 @@ const MANIFESTACAO = {
 // ══════════════════════════════════════════════════════
 const STORAGE_BUCKET = "nfe-xmls";
 
-/**
- * Salva XML completo no Supabase Storage.
- * Retorna o path salvo ou lança erro.
- */
 async function salvarXmlStorage(supabase, empresaId, chNFe, xmlContent) {
   const path = `${empresaId}/nfe/${chNFe}.xml`;
   const { error } = await supabase.storage
@@ -74,11 +70,6 @@ async function salvarXmlStorage(supabase, empresaId, chNFe, xmlContent) {
   return path;
 }
 
-/**
- * Retorna o XML para a coluna xml_completo:
- * - Se <= 40000 chars: salva na coluna (cache rápido para frontend)
- * - Se > 40000 chars: retorna null (XML grande fica só no Storage)
- */
 function xmlParaColuna(xmlContent) {
   return xmlContent.length <= 40000 ? xmlContent : null;
 }
@@ -237,13 +228,70 @@ function extrairParcelas(xmlContent) {
   const dupMatches = xmlContent.match(/<dup>([\s\S]*?)<\/dup>/gi) || [];
   dupMatches.forEach((dup, index) => {
     const nDup = xmlTag(dup, "nDup") || String(index + 1);
-    const dVenc = xmlTag(dup, "dVenc");
+    let dVenc = xmlTag(dup, "dVenc");
     const vDup = parseFloat(xmlTag(dup, "vDup"));
+
+    // Normalizar dVenc: YYYYMMDD → YYYY-MM-DD
+    if (dVenc && dVenc.length === 8 && !dVenc.includes("-")) {
+      dVenc = `${dVenc.slice(0, 4)}-${dVenc.slice(4, 6)}-${dVenc.slice(6, 8)}`;
+    }
+
+    // parcela_numero: tenta extrair número do nDup (ex: "001"→1, "19A"→19, "A"→index)
+    const numerico = parseInt(nDup.replace(/\D/g, ""), 10);
+    const parcelaNumero = isNaN(numerico) ? index + 1 : numerico;
+
     if (dVenc && vDup > 0) {
-      parcelas.push({ nDup, vencimento: dVenc, valor: vDup, index: index + 1 });
+      parcelas.push({
+        nDup,
+        vencimento: dVenc,
+        valor: vDup,
+        index: index + 1,
+        parcelaNumero,
+      });
     }
   });
   return parcelas;
+}
+
+// ══════════════════════════════════════════════════════
+// HELPER: Buscar ou criar entidade pelo CNPJ do emitente
+// ══════════════════════════════════════════════════════
+async function buscarOuCriarEntidade(supabase, empresaId, cnpjEmitente, nomeEmitente) {
+  if (!cnpjEmitente) return null;
+  const cnpjLimpo = cnpjEmitente.replace(/\D/g, "");
+  if (!cnpjLimpo) return null;
+
+  // Busca existente pelo CNPJ
+  const { data: existente } = await supabase
+    .from("entidades")
+    .select("id")
+    .eq("empresa_id", empresaId)
+    .eq("cnpj_cpf", cnpjLimpo)
+    .maybeSingle();
+
+  if (existente) return existente.id;
+
+  // Cria nova entidade automaticamente
+  const { data: nova, error } = await supabase
+    .from("entidades")
+    .insert({
+      empresa_id: empresaId,
+      razao_social: nomeEmitente || cnpjLimpo,
+      cnpj_cpf: cnpjLimpo,
+      tipo: "fornecedor",
+      ativo: true,
+      prazo_padrao_dias: 30,
+    })
+    .select("id")
+    .single();
+
+  if (error) {
+    console.error(`[buscarOuCriarEntidade] Erro ao criar entidade ${cnpjLimpo}: ${error.message}`);
+    return null;
+  }
+
+  console.log(`[buscarOuCriarEntidade] Entidade criada: ${nomeEmitente || cnpjLimpo}`);
+  return nova.id;
 }
 
 // ══════════════════════════════════════════════════════
@@ -286,6 +334,67 @@ async function salvarSyncLog(supabase, empresaId, status, notasEncontradas, nota
     });
   } catch (e) {
     console.error(`[salvarSyncLog] Erro: ${e.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+// HELPER: Criar contas a pagar das parcelas
+// ══════════════════════════════════════════════════════
+async function criarContasPagar(supabase, empresaId, nfId, numero, nomeEmitente, dataEmissao, valorTotal, chNFe, xmlContent, errors, cnpjEmitente) {
+  try {
+    // Busca ou cria entidade pelo CNPJ
+    const entidadeId = await buscarOuCriarEntidade(supabase, empresaId, cnpjEmitente, nomeEmitente);
+
+    const parcelas = extrairParcelas(xmlContent);
+    const dataEmissaoFormatada = dataEmissao ? dataEmissao.split("T")[0] : null;
+
+    if (parcelas.length > 0) {
+      const contasInsert = parcelas.map((p) => ({
+        empresa_id: empresaId,
+        tipo: "pagar",
+        status: "previsto",
+        origem: "sefaz",
+        descricao: `NF ${numero || ""} - ${nomeEmitente || ""} (${p.nDup}/${parcelas.length})`.trim(),
+        valor_original: p.valor,
+        data_vencimento: p.vencimento,
+        data_emissao: dataEmissaoFormatada,
+        nota_fiscal_id: nfId,
+        entidade_id: entidadeId,
+        parcela_numero: p.parcelaNumero,
+        parcela_total: parcelas.length,
+        documento_ref: chNFe,
+      }));
+
+      const { error: contasErr } = await supabase.from("contas").insert(contasInsert);
+      if (contasErr) {
+        console.error(`[criarContas] Erro: ${contasErr.message}`);
+        errors.push(`Erro contas NF ${chNFe.slice(-10)}: ${contasErr.message}`);
+      } else {
+        console.log(`[criarContas] NF ${numero}: ${parcelas.length} conta(s) criada(s) | entidade: ${entidadeId || "não vinculada"}`);
+      }
+    } else {
+      // Sem duplicatas: NF à vista — vencimento = hoje (usuário ajusta)
+      const hoje = new Date().toISOString().split("T")[0];
+      await supabase.from("contas").insert({
+        empresa_id: empresaId,
+        tipo: "pagar",
+        status: "previsto",
+        origem: "sefaz",
+        descricao: `NF ${numero || ""} - ${nomeEmitente || ""}`.trim(),
+        valor_original: valorTotal || 0,
+        data_vencimento: hoje,
+        data_emissao: dataEmissaoFormatada,
+        nota_fiscal_id: nfId,
+        entidade_id: entidadeId,
+        parcela_numero: 1,
+        parcela_total: 1,
+        documento_ref: chNFe,
+      });
+      console.log(`[criarContas] NF ${numero}: 1 conta criada (sem duplicatas no XML) | entidade: ${entidadeId || "não vinculada"}`);
+    }
+  } catch (e) {
+    console.error(`[criarContas] Erro: ${e.message}`);
+    errors.push(`Erro inesperado contas NF ${chNFe.slice(-10)}: ${e.message}`);
   }
 }
 
@@ -367,7 +476,6 @@ app.post("/api/consulta-chave", authMiddleware, async (req, res) => {
     });
   }
 
-  // ── Extrair e descomprimir o docZip ───────────────────────────────────────
   const docZipMatch = respText.match(/<docZip[^>]*>([^<]+)<\/docZip>/i);
   let xmlCompleto = null;
   let isComplete = false;
@@ -434,7 +542,7 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
     .eq("empresa_id", empresaId).eq("chave_acesso", chNFe).maybeSingle();
 
   // ── Upgrade: resumo → completo ────────────────────────────────────────────
-  if (existing?.data && isNFeProc && existing.data.tipo_documento !== "completo") {
+  if (existing && isNFeProc && existing.tipo_documento !== "completo") {
     const emitBlock = xmlContent.match(/<emit>([\s\S]*?)<\/emit>/)?.[1] || "";
     const upCnpj = xmlTag(emitBlock, "CNPJ") || xmlTag(emitBlock, "CPF") || null;
     const upNome = xmlTag(emitBlock, "xNome") || null;
@@ -444,7 +552,6 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
     const totBlock = xmlContent.match(/<ICMSTot>([\s\S]*?)<\/ICMSTot>/)?.[1] || "";
     const upValor = parseFloat(xmlTag(totBlock, "vNF")) || parseFloat(xmlTag(xmlContent, "vNF")) || null;
 
-    // ── CORREÇÃO: salvar XML no Storage, sem truncar ──────────────────────
     let storagePath = null;
     try {
       storagePath = await salvarXmlStorage(supabase, empresaId, chNFe, xmlContent);
@@ -455,8 +562,8 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
 
     await supabase.from("notas_fiscais").update({
       tipo_documento: "completo",
-      xml_completo: xmlParaColuna(xmlContent),       // ← CORRIGIDO: sem slice(50000)
-      xml_storage_path: storagePath,                  // ← NOVO: salva no Storage
+      xml_completo: xmlParaColuna(xmlContent),
+      xml_storage_path: storagePath,
       numero_nf: upNumero,
       serie: upSerie,
       data_emissao: upData,
@@ -464,20 +571,19 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
       emit_cnpj: upCnpj,
       emit_razao_social: upNome,
       processado: true,
-    }).eq("id", existing.data.id);
+    }).eq("id", existing.id);
 
     console.log(`[processarDoc] NF ${upNumero || chNFe.slice(-10)}: atualizada resumo → completo`);
 
-    // Criar contas a pagar se não existem
     const { data: contasExist } = await supabase
-      .from("contas").select("id").eq("nota_fiscal_id", existing.data.id).limit(1);
+      .from("contas").select("id").eq("nota_fiscal_id", existing.id).limit(1);
     if (!contasExist || contasExist.length === 0) {
-      await criarContasPagar(supabase, empresaId, existing.data.id, upNumero, upNome, upData, upValor, chNFe, xmlContent, errors);
+      await criarContasPagar(supabase, empresaId, existing.id, upNumero, upNome, upData, upValor, chNFe, xmlContent, errors, upCnpj);
     }
-    return { action: "upgrade", nfId: existing.data.id };
+    return { action: "upgrade", nfId: existing.id };
   }
 
-  if (existing?.data) return null; // já existe e completo, pular
+  if (existing) return null;
 
   // ── Insert: nova NF ───────────────────────────────────────────────────────
   let numero, serie, dataEmissao, valorTotal, cnpjEmitente, nomeEmitente, tipoDoc;
@@ -512,7 +618,6 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
     tipoDoc = "outro";
   }
 
-  // ── CORREÇÃO: salvar XML no Storage, sem truncar ──────────────────────────
   let storagePath = null;
   try {
     storagePath = await salvarXmlStorage(supabase, empresaId, chNFe, xmlContent);
@@ -533,8 +638,8 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
     status_sefaz: "recebida",
     nsu: nsuVal,
     tipo_documento: tipoDoc,
-    xml_completo: xmlParaColuna(xmlContent),          // ← CORRIGIDO: sem slice(50000)
-    xml_storage_path: storagePath,                     // ← NOVO: salva no Storage
+    xml_completo: xmlParaColuna(xmlContent),
+    xml_storage_path: storagePath,
     origem: "sefaz",
     processado: isNFeProc,
   }).select("id").single();
@@ -570,61 +675,10 @@ async function processarDocZip(supabase, docZip, empresaId, cnpj, tpAmb, certPem
 
   // Auto-gerar contas a pagar para procNFe
   if (isNFeProc) {
-    await criarContasPagar(supabase, empresaId, insertedNF.id, numero, nomeEmitente, dataEmissao, valorTotal, chNFe, xmlContent, errors);
+    await criarContasPagar(supabase, empresaId, insertedNF.id, numero, nomeEmitente, dataEmissao, valorTotal, chNFe, xmlContent, errors, cnpjEmitente);
   }
 
   return { action: "insert", nfId: insertedNF.id };
-}
-
-// ══════════════════════════════════════════════════════
-// HELPER: Criar contas a pagar das parcelas
-// ══════════════════════════════════════════════════════
-async function criarContasPagar(supabase, empresaId, nfId, numero, nomeEmitente, dataEmissao, valorTotal, chNFe, xmlContent, errors) {
-  try {
-    const parcelas = extrairParcelas(xmlContent);
-    if (parcelas.length > 0) {
-      const contasInsert = parcelas.map((p) => ({
-        empresa_id: empresaId,
-        tipo: "pagar",
-        status: "previsto",
-        origem: "sefaz",
-        descricao: `NF-e ${numero || ""} - ${nomeEmitente || ""} (${p.nDup}/${parcelas.length})`.trim(),
-        valor_original: p.valor,
-        data_vencimento: p.vencimento,
-        data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
-        nota_fiscal_id: nfId,
-        parcela_numero: parseInt(p.nDup) || p.index,
-        parcela_total: parcelas.length,
-        documento_ref: chNFe,
-      }));
-      const { error: contasErr } = await supabase.from("contas").insert(contasInsert);
-      if (contasErr) {
-        console.error(`[criarContas] Erro: ${contasErr.message}`);
-        errors.push(`Erro contas NF ${chNFe.slice(-10)}: ${contasErr.message}`);
-      } else {
-        console.log(`[criarContas] NF ${numero}: ${parcelas.length} conta(s) criada(s)`);
-      }
-    } else {
-      // Sem parcelas: criar 1 conta com valor total
-      await supabase.from("contas").insert({
-        empresa_id: empresaId,
-        tipo: "pagar",
-        status: "previsto",
-        origem: "sefaz",
-        descricao: `NF-e ${numero || ""} - ${nomeEmitente || ""}`.trim(),
-        valor_original: valorTotal || 0,
-        data_vencimento: dataEmissao ? dataEmissao.split("T")[0] : new Date().toISOString().split("T")[0],
-        data_emissao: dataEmissao ? dataEmissao.split("T")[0] : null,
-        nota_fiscal_id: nfId,
-        parcela_numero: 1,
-        parcela_total: 1,
-        documento_ref: chNFe,
-      });
-      console.log(`[criarContas] NF ${numero}: 1 conta criada (sem parcelas no XML)`);
-    }
-  } catch (e) {
-    console.error(`[criarContas] Erro: ${e.message}`);
-  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -727,7 +781,8 @@ app.post("/api/sync-sefaz", authMiddleware, async (req, res) => {
       .from("notas_fiscais")
       .select("id, chave_acesso")
       .eq("empresa_id", empresa_id)
-      .is("status_manifestacao", null)
+      .eq("tipo_documento", "resumo")
+      .or("status_manifestacao.is.null,status_manifestacao.eq.pendente")
       .not("chave_acesso", "is", null)
       .limit(5);
 
@@ -838,7 +893,7 @@ app.post("/api/manifestar-sefaz", authMiddleware, async (req, res) => {
 
   const cStatLote = xmlTag(respText, "cStat");
   const evento = parseRetEvento(respText);
-  const sucesso = evento.cStat === "135" || evento.cStat === "136";
+  const sucesso = evento.cStat === "135" || evento.cStat === "136" || evento.cStat === "573";
 
   console.log(`[manifestar] Lote cStat: ${cStatLote} | Evento cStat: ${evento.cStat} | ${evento.xMotivo}`);
 
@@ -1085,7 +1140,7 @@ async function autoSyncTodasEmpresas() {
 }
 
 // Sync automático: todo dia às 02:00 BRT
-cron.schedule("0 5 * * *", () => {
+cron.schedule("0 2 * * *", () => {
   console.log("[cron] Disparando sync automático 02:00 BRT...");
   autoSyncTodasEmpresas();
 }, { timezone: "America/Sao_Paulo" });
